@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""Minimal stand-in for the 1Password CLI used by the integration tests.
+
+Implements just the subset of `op` that opwallet calls, persisting items as
+JSON files under $FAKE_OP_DIR. Set FAKE_OP_SIGNED_OUT=1 to simulate a locked
+CLI.
+"""
+import json, os, sys, uuid
+
+ROOT = os.environ.get("FAKE_OP_DIR") or sys.exit("FAKE_OP_DIR not set")
+LOG = os.path.join(ROOT, "calls.log")
+os.makedirs(ROOT, exist_ok=True)
+with open(LOG, "a") as f:
+    f.write(json.dumps(sys.argv[1:]) + "\n")
+
+args = sys.argv[1:]
+
+
+def flag(name, default=None):
+    if name in args:
+        i = args.index(name)
+        return args[i + 1]
+    return default
+
+
+def die(msg, code=1):
+    sys.stderr.write("[ERROR] " + msg + "\n")
+    sys.exit(code)
+
+
+if os.environ.get("FAKE_OP_SIGNED_OUT"):
+    die("You are not currently signed in. Please run `op signin --help`")
+
+
+def items():
+    out = []
+    for name in sorted(os.listdir(ROOT)):
+        if name.endswith(".json"):
+            with open(os.path.join(ROOT, name)) as f:
+                out.append(json.load(f))
+    return out
+
+
+def find(ref, vault):
+    matches = [
+        it
+        for it in items()
+        if (it["id"] == ref or it["title"] == ref)
+        and (vault is None or it["vault"]["name"] == vault or it["vault"]["id"] == vault)
+    ]
+    if not matches:
+        die(f'"{ref}" isn\'t an item. Specify the item with its UUID, name, or domain.')
+    if len(matches) > 1:
+        die(f'More than one item matches "{ref}". Specify the item with its UUID.')
+    return matches[0]
+
+
+TEMPLATE = {
+    "title": "",
+    "category": "CRYPTO_WALLET",
+    "fields": [
+        {"id": "recoveryPhrase", "type": "STRING", "label": "recovery phrase", "value": ""},
+        {"id": "password", "type": "CONCEALED", "label": "password", "value": ""},
+        {"id": "walletAddress", "type": "STRING", "label": "wallet address", "value": ""},
+    ],
+}
+
+if args[:1] == ["signout"]:
+    pass
+elif args[:1] == ["whoami"]:
+    print(json.dumps({"url": "https://my.1password.com", "email": "test@example.com", "account_uuid": "ACCT"}))
+elif args[:3] == ["item", "template", "get"]:
+    print(json.dumps(TEMPLATE))
+elif args[:2] == ["item", "list"]:
+    vault = flag("--vault")
+    cat = flag("--categories")
+    out = []
+    for it in items():
+        if cat and it["category"].replace("_", " ").lower() != cat.lower():
+            continue
+        if vault and it["vault"]["name"] != vault:
+            continue
+        out.append({k: it[k] for k in ("id", "title", "category", "vault", "tags")})
+    print(json.dumps(out))
+elif args[:2] == ["item", "create"]:
+    if args[2:3] != ["-"]:
+        die('"" is not a recognized item category, must be one of: Login, Crypto Wallet')
+    body = json.load(sys.stdin)
+    if "--title" in args:
+        body["title"] = flag("--title")
+    body["id"] = uuid.uuid4().hex[:26]
+    body["vault"] = {"id": "vaultid", "name": flag("--vault", "Private")}
+    body.setdefault("tags", [])
+    for it in items():
+        if it["title"] == body["title"]:
+            # Real 1Password allows duplicates; keep it that way so opwallet's own
+            # pre-check is what gets tested.
+            pass
+    with open(os.path.join(ROOT, body["id"] + ".json"), "w") as f:
+        json.dump(body, f)
+    print(json.dumps(body))
+elif args[:2] == ["item", "get"]:
+    if args[2] == "-":
+        refs = [o["id"] for o in json.load(sys.stdin) if "id" in o]
+    else:
+        refs = [args[2]]
+    fields = flag("--fields")
+    for ref in refs:
+        it = find(ref, flag("--vault"))
+        if fields:
+            wanted = fields.split("=", 1)[1]
+            sel = [dict(f, reference=f"op://{it['vault']['name']}/{it['title']}/{f.get('label')}")
+                   for f in it["fields"] if f.get("label") == wanted]
+            if len(sel) == 1:
+                print(json.dumps(sel[0]))
+            else:
+                print(json.dumps(sel))
+        else:
+            print(json.dumps(it))
+else:
+    die("unsupported fake op invocation: " + " ".join(args))

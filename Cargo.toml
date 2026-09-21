@@ -1,0 +1,53 @@
+[package]
+name = "opwallet"
+version = "0.1.0"
+edition = "2024"
+description = "A CLI crypto wallet that keeps its seed phrase in 1Password"
+license = "MIT"
+repository = "https://github.com/chris13524/opwallet"
+
+[[bin]]
+name = "opwallet"
+path = "src/main.rs"
+
+[dependencies]
+alloy-primitives = "1.7.3"
+alloy-signer = "2.4.2"
+alloy-signer-local = "2.4.2"
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+zeroize = "1.9.0"
+k256 = { version = "0.13", default-features = false, features = ["arithmetic", "ecdsa", "std"] }
+sha2 = "0.10"
+hmac = "0.12"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+subtle = "2.6"
+getrandom = "0.3"
+tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
+ed25519-dalek = "2"
+hkdf = "0.12"
+bs58 = "0.5.1"
+base64 = "0.23.1"
+ctrlc = "3.5.2"
+ureq = { version = "3.4.2", features = ["json"] }
+alloy-dyn-abi = { version = "1.7.3", features = ["eip712"] }
+alloy-consensus = "2.4.2"
+alloy-eips = "2.4.2"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+ratatui = "0.30.2"
+crossterm = "0.29.0"
+arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+strip = true
+lto = true
+
+[dev-dependencies]
+alloy-primitives = "1.7.3"
+serde_json = "1.0.151"
