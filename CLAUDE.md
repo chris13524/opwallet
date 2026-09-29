@@ -14,6 +14,15 @@
 - Run `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`
   and `cargo test` before every push. CI runs the same on Linux and macOS.
 
+## Personal information
+- Never include personal information in commit messages, test cases, code,
+  comments or docs: no real crypto wallets, seed phrases, addresses, names,
+  emails, usernames, hostnames, 1Password account/vault/item IDs, or local
+  file paths (e.g. home directories). This includes anything the user pastes
+  from their own machine, such as `op` output or error messages; reduce it to
+  the behavior it shows and use generic placeholders or well-known public
+  test values instead.
+
 ## Project shape
 - `src/secret.rs`: `SecretBuf`, the only container for seed material
   (mlocked, non-dumpable, zeroed on drop). Never put a phrase in a `String`.
