@@ -54,7 +54,7 @@ brew install 1password-cli        # macOS; see the docs for other platforms
 cargo install --path .
 opwallet doctor                   # checks that op is installed and signed in
 
-# 3. Get a free WalletConnect project ID from https://cloud.reown.com
+# 3. Get a free WalletConnect project ID from https://dashboard.walletconnect.com
 export OPWALLET_PROJECT_ID=...
 
 # 4. Open the dashboard

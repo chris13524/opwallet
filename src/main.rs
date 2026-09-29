@@ -59,7 +59,7 @@ struct Cli {
 
 #[derive(Args)]
 struct RelayArgs {
-    /// WalletConnect Cloud project ID (free at https://cloud.reown.com).
+    /// WalletConnect project ID (free at https://dashboard.walletconnect.com).
     #[arg(long, env = "OPWALLET_PROJECT_ID")]
     project_id: Option<String>,
 
@@ -262,7 +262,7 @@ fn project_id(given: Option<String>) -> Result<String> {
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "no WalletConnect project ID: pass --project-id or set OPWALLET_PROJECT_ID \
-                 (free at https://cloud.reown.com)"
+                 (free at https://dashboard.walletconnect.com)"
             )
         })
 }
