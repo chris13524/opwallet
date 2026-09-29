@@ -7,8 +7,10 @@
 //! CLI handles that transparently.
 //!
 //! Secret handling:
-//! * item JSON is passed to `op` over stdin, never on the command line, so it
-//!   is not visible in process listings or shell history;
+//! * item JSON is passed to `op` through a pipe (fd 3, read as
+//!   `--template /dev/fd/3`, on Unix; stdin elsewhere), never on the command
+//!   line or in a file, so it is not visible in process listings, shell
+//!   history or on disk;
 //! * everything `op` prints is read straight into a locked [`SecretBuf`];
 //! * the seed phrase is deserialized by *borrowing* from that buffer
 //!   (no heap copy) and then copied into its own locked buffer;
@@ -216,7 +218,6 @@ struct FieldWrite<'a> {
 #[derive(Serialize)]
 struct ItemWrite<'a> {
     title: &'a str,
-    category: &'static str,
     tags: [&'static str; 1],
     #[serde(skip_serializing_if = "Option::is_none")]
     sections: Option<Value>,
@@ -284,7 +285,7 @@ fn build_item<'a>(template: &Value, w: &NewWallet<'a>) -> ItemWrite<'a> {
 
     ItemWrite {
         title: w.title,
-        category: "CRYPTO_WALLET",
+        // No `category`: it goes on the command line (see `create_wallet`).
         tags: [TAG],
         sections: template.get("sections").cloned(),
         fields,
@@ -294,6 +295,15 @@ fn build_item<'a>(template: &Value, w: &NewWallet<'a>) -> ItemWrite<'a> {
 // ---------------------------------------------------------------------------
 // op CLI transport
 // ---------------------------------------------------------------------------
+
+/// Data for `op` to read, always through a pipe.
+enum Input<'a> {
+    /// On stdin, for `op ... -`.
+    Stdin(&'a [u8]),
+    /// On file descriptor 3, for `--template /dev/fd/3`.
+    #[cfg(unix)]
+    Fd3(&'a [u8]),
+}
 
 /// [`SecretStore`] backed by the `op` command line tool.
 pub struct OpCli {
@@ -365,7 +375,7 @@ impl OpCli {
             "--format",
             "json",
         ];
-        let out = self.run(args, Some(&stdin)).ok()?;
+        let out = self.run(args, Some(Input::Stdin(&stdin))).ok()?;
         // op prints one JSON value per item (an object, or an array of field
         // objects); a single wrapping array is tolerated as well.
         let mut values: Vec<Value> = serde_json::Deserializer::from_slice(out.as_bytes())
@@ -402,67 +412,112 @@ impl OpCli {
 
     /// Run `op` with `args`, optionally feeding `stdin`, returning stdout in
     /// locked memory.
-    fn run<I, S>(&self, args: I, stdin: Option<&[u8]>) -> Result<SecretBuf>
+    fn run<I, S>(&self, args: I, input: Option<Input<'_>>) -> Result<SecretBuf>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let mut cmd = Command::new(&self.binary);
-        cmd.args(args)
-            .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = cmd.spawn().with_context(|| {
-            format!(
-                "could not run {:?}. Is the 1Password CLI installed and on PATH? \
-                 See https://developer.1password.com/docs/cli/get-started/",
-                self.binary
-            )
-        })?;
+        thread::scope(|scope| {
+            let mut cmd = Command::new(&self.binary);
+            cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
-        // Drain stderr concurrently so a chatty op can never deadlock us.
-        let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
-        let stderr_thread = thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stderr_pipe.read_to_end(&mut buf);
-            buf
-        });
-
-        if let Some(data) = stdin {
-            let mut pipe = child.stdin.take().expect("stdin was piped");
-            pipe.write_all(data).context("failed to write to op stdin")?;
-            drop(pipe);
-        }
-
-        let mut out = SecretBuf::with_capacity(OUTPUT_CAPACITY)?;
-        let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
-        loop {
-            if out.spare_mut().is_empty() {
-                out.reserve(out.capacity())?;
+            // The read end of the input pipe, handed to `op` as stdin or fd 3.
+            let mut data: Option<(&[u8], std::io::PipeWriter)> = None;
+            #[cfg(unix)]
+            let mut fd3_reader = None;
+            match input {
+                None => {}
+                Some(Input::Stdin(bytes)) => {
+                    let (reader, writer) =
+                        std::io::pipe().context("failed to create a pipe for op")?;
+                    cmd.stdin(reader);
+                    data = Some((bytes, writer));
+                }
+                #[cfg(unix)]
+                Some(Input::Fd3(bytes)) => {
+                    use std::os::{fd::AsRawFd, unix::process::CommandExt};
+                    let (reader, writer) =
+                        std::io::pipe().context("failed to create a pipe for op")?;
+                    let fd = reader.as_raw_fd();
+                    // SAFETY: dup2 and fcntl are async-signal-safe, and the
+                    // closure touches nothing but these file descriptors.
+                    unsafe {
+                        cmd.pre_exec(move || {
+                            if libc::dup2(fd, 3) < 0 || libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                            Ok(())
+                        });
+                    }
+                    fd3_reader = Some(reader);
+                    data = Some((bytes, writer));
+                }
             }
-            let n = stdout_pipe.read(out.spare_mut()).context("failed to read op output")?;
-            if n == 0 {
-                break;
-            }
-            out.advance(n);
-        }
-        drop(stdout_pipe);
 
-        let status = child.wait().context("failed waiting for op")?;
-        let stderr = stderr_thread.join().unwrap_or_default();
-        if !status.success() {
-            let stderr = String::from_utf8_lossy(&stderr);
-            bail!("op exited with {status}: {}", stderr.trim());
-        }
-        Ok(out)
+            let spawned = cmd.spawn();
+            // Our copies of the read end must go, or a writer blocked on a
+            // full pipe would never see `op` exit.
+            drop(cmd);
+            #[cfg(unix)]
+            drop(fd3_reader);
+            let mut child = spawned.with_context(|| {
+                format!(
+                    "could not run {:?}. Is the 1Password CLI installed and on PATH? \
+                     See https://developer.1password.com/docs/cli/get-started/",
+                    self.binary
+                )
+            })?;
+
+            let writer = data.map(|(bytes, mut pipe)| {
+                scope.spawn(move || {
+                    let result = pipe.write_all(bytes);
+                    drop(pipe);
+                    result
+                })
+            });
+
+            // Drain stderr concurrently so a chatty op can never deadlock us.
+            let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
+            let stderr_thread = scope.spawn(move || {
+                let mut buf = Vec::new();
+                let _ = stderr_pipe.read_to_end(&mut buf);
+                buf
+            });
+
+            let mut out = SecretBuf::with_capacity(OUTPUT_CAPACITY)?;
+            let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
+            loop {
+                if out.spare_mut().is_empty() {
+                    out.reserve(out.capacity())?;
+                }
+                let n = stdout_pipe.read(out.spare_mut()).context("failed to read op output")?;
+                if n == 0 {
+                    break;
+                }
+                out.advance(n);
+            }
+            drop(stdout_pipe);
+
+            let status = child.wait().context("failed waiting for op")?;
+            let stderr = stderr_thread.join().unwrap_or_default();
+            let written = writer.map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)));
+            if !status.success() {
+                let stderr = String::from_utf8_lossy(&stderr);
+                bail!("op exited with {status}: {}", stderr.trim());
+            }
+            if let Some(result) = written {
+                result.context("failed to write op's input")?;
+            }
+            Ok(out)
+        })
     }
 
-    fn run_value<I, S>(&self, args: I, stdin: Option<&[u8]>) -> Result<Value>
+    fn run_value<I, S>(&self, args: I, input: Option<Input<'_>>) -> Result<Value>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let out = self.run(args, stdin)?;
+        let out = self.run(args, input)?;
         serde_json::from_slice(out.as_bytes()).context("op returned invalid JSON")
     }
 
@@ -526,11 +581,29 @@ impl SecretStore for OpCli {
         serde_json::to_writer(&mut body, &item).context("failed to encode item JSON")?;
         drop(item);
 
-        // `-` tells op to read the item template from stdin.
-        let mut args = vec!["item".to_string(), "create".to_string(), "-".to_string()];
+        // The item JSON goes through a pipe, never a file or argv. op reads
+        // a piped `-` template unreliably when another program runs it (it
+        // then sees no category: `"" is not a recognized item category`),
+        // so on Unix the pipe is fd 3 and op opens it as `--template`.
+        #[cfg(unix)]
+        let (template, input) =
+            (["--template".to_string(), "/dev/fd/3".to_string()], Input::Fd3(body.as_bytes()));
+        #[cfg(not(unix))]
+        let (template, input) = (["-".to_string()], Input::Stdin(body.as_bytes()));
+        // The category goes by name as a flag. The template's `category`
+        // field only takes op's internal spellings, and op 2.39 spells
+        // Crypto Wallet `CUSTOM` (`category_id` 115) on output, so the name
+        // is the only stable way to ask for it.
+        let mut args = vec![
+            "item".to_string(),
+            "create".to_string(),
+            "--category".to_string(),
+            CATEGORY.to_string(),
+        ];
+        args.extend(template);
         args.extend(vault_args(w.vault));
         args.extend(["--format".into(), "json".into()]);
-        let created = self.run_value(&args, Some(body.as_bytes()))?;
+        let created = self.run_value(&args, Some(input))?;
         drop(body);
 
         let header: ItemHeader =
@@ -683,7 +756,7 @@ mod tests {
         };
         let item = serde_json::to_value(build_item(&template, &w)).unwrap();
         assert_eq!(item["title"], "t");
-        assert_eq!(item["category"], "CRYPTO_WALLET");
+        assert!(item.get("category").is_none(), "{item}");
         assert_eq!(item["tags"], json!(["opwallet"]));
         assert_eq!(item["sections"], json!([{"id": "wallet"}]));
         let fields = item["fields"].as_array().unwrap();

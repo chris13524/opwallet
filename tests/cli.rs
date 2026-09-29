@@ -100,7 +100,11 @@ fn create_stores_crypto_wallet_item_and_verifies_roundtrip() {
     let items = env.items();
     assert_eq!(items.len(), 1);
     let item = &items[0];
-    assert_eq!(item["category"], "CRYPTO_WALLET");
+    // How op 2.39 reports a Crypto Wallet.
+    assert_eq!(
+        (&item["category"], &item["category_id"]),
+        (&serde_json::json!("CUSTOM"), &serde_json::json!("115"))
+    );
     assert_eq!(item["title"], "Main wallet");
     assert_eq!(item["tags"], serde_json::json!(["opwallet"]));
 
@@ -126,6 +130,13 @@ fn create_stores_crypto_wallet_item_and_verifies_roundtrip() {
     for word in phrase.split_whitespace() {
         assert!(!env.calls().contains(&format!("\"{word}")), "seed word leaked onto argv");
     }
+    // The category goes by name as a flag, and the item JSON arrives on a
+    // pipe (fd 3), which op opens as its template.
+    let create =
+        env.calls().lines().find(|l| l.contains(r#""item", "create""#)).unwrap().to_string();
+    assert!(create.contains(r#""--category", "Crypto Wallet""#), "{create}");
+    #[cfg(unix)]
+    assert!(create.contains(r#""--template", "/dev/fd/3""#), "{create}");
 
     // `address` re-derives and agrees.
     let out = env.run(&["address", "--name", "Main wallet"]);

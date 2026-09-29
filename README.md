@@ -299,7 +299,7 @@ places as possible, and for none of those places to leak.
 **What never happens**
 
 * The phrase is never passed on the command line (visible in `ps`, shell
-  history and audit logs). Item JSON goes to `op` over stdin.
+  history and audit logs). Item JSON goes to `op` through a pipe, never a file.
 * It never touches environment variables, temp files, logs or the clipboard.
 * It is never printed unless you explicitly pass `--reveal` (with a warning).
 * It never appears in an error message: invalid phrases are reported by word

@@ -19,7 +19,7 @@
   (mlocked, non-dumpable, zeroed on drop). Never put a phrase in a `String`.
 - `src/wallet.rs`: in-crate BIP-39/BIP-32; do not swap in a mnemonic crate.
 - `src/onepassword.rs`: `op` CLI transport behind the `SecretStore` trait.
-  Secrets go to `op` via stdin only; listings fetch only the address field.
+  Secrets go to `op` through a pipe only; listings fetch only the address field.
 - `src/walletconnect/`: WalletConnect v2 (relay client, crypto, session
   negotiation, request handling in `eth.rs`, Sign-In with Ethereum for
   proposal `requests.authentication` in `auth.rs`, user interaction behind
@@ -48,6 +48,8 @@
   startup only reads public address fields; the first seed read happens at
   the first signature.
 - `op signout` runs after every seed read unless `--no-relock` is given.
-- `op item create` must be invoked with `-` to read the template from stdin.
+- `op item create` reads the item JSON from a pipe: `--template /dev/fd/3` on
+  Unix (op mis-reads a piped `-` template when run from another program),
+  `-` on stdin elsewhere. Never a regular file or argv.
 - opwallet never deletes wallets (1Password items); removing a wallet from
   a session only changes what that dapp is offered.

@@ -5,7 +5,7 @@ Implements just the subset of `op` that opwallet calls, persisting items as
 JSON files under $FAKE_OP_DIR. Set FAKE_OP_SIGNED_OUT=1 to simulate a locked
 CLI.
 """
-import json, os, sys, uuid
+import json, os, stat, sys, uuid
 
 ROOT = os.environ.get("FAKE_OP_DIR") or sys.exit("FAKE_OP_DIR not set")
 LOG = os.path.join(ROOT, "calls.log")
@@ -21,6 +21,12 @@ def flag(name, default=None):
         i = args.index(name)
         return args[i + 1]
     return default
+
+
+def category_name(item):
+    if item.get("category_id") == "115":
+        return "Crypto Wallet"
+    return item["category"].replace("_", " ")
 
 
 def die(msg, code=1):
@@ -57,7 +63,8 @@ def find(ref, vault):
 
 TEMPLATE = {
     "title": "",
-    "category": "CRYPTO_WALLET",
+    "category": "CUSTOM",
+    "category_id": "115",
     "fields": [
         {"id": "recoveryPhrase", "type": "STRING", "label": "recovery phrase", "value": ""},
         {"id": "password", "type": "CONCEALED", "label": "password", "value": ""},
@@ -76,16 +83,39 @@ elif args[:2] == ["item", "list"]:
     cat = flag("--categories")
     out = []
     for it in items():
-        if cat and it["category"].replace("_", " ").lower() != cat.lower():
+        if cat and category_name(it).lower() != cat.lower():
             continue
         if vault and it["vault"]["name"] != vault:
             continue
         out.append({k: it[k] for k in ("id", "title", "category", "vault", "tags")})
     print(json.dumps(out))
 elif args[:2] == ["item", "create"]:
-    if args[2:3] != ["-"]:
+    template = flag("--template")
+    stdin_piped = stat.S_ISFIFO(os.fstat(0).st_mode)
+    if template is not None:
+        # The real op refuses a template file and piped stdin together.
+        if stdin_piped:
+            die("cannot create an item from template and stdin at the same time")
+        with open(template) as f:
+            body = json.load(f)
+    elif args[2:3] == ["-"] and stdin_piped:
+        body = json.load(sys.stdin)
+    else:
         die('"" is not a recognized item category, must be one of: Login, Crypto Wallet')
-    body = json.load(sys.stdin)
+    # Like op 2.39: `--category` takes a name (ignoring case and whitespace),
+    # the template's `category` only an internal spelling, and Crypto Wallet
+    # is stored as CUSTOM with category_id 115.
+    names = {"login": ("LOGIN", "001"), "cryptowallet": ("CUSTOM", "115")}
+    spellings = {"LOGIN": ("LOGIN", "001")}
+    given = flag("--category")
+    if given is not None:
+        resolved = names.get("".join(given.split()).lower())
+    else:
+        given = body.get("category", "")
+        resolved = spellings.get(given)
+    if resolved is None:
+        die(f'"{given}" is an unknown item type: "{given}" isn\'t a recognized item type', 8)
+    body["category"], body["category_id"] = resolved
     if "--title" in args:
         body["title"] = flag("--title")
     body["id"] = uuid.uuid4().hex[:26]
