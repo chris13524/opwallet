@@ -34,6 +34,8 @@ pub struct Incoming {
     pub topic: String,
     pub message: String,
     pub tag: u64,
+    /// WalletConnect Verify v3 attestation JWT the relay attached, if any.
+    pub attestation: Option<String>,
 }
 
 enum Frame {
@@ -294,6 +296,7 @@ impl Relay {
                         topic: topic.to_string(),
                         message: message.to_string(),
                         tag: data["tag"].as_u64().unwrap_or(0),
+                        attestation: data["attestation"].as_str().map(str::to_string),
                     }));
                 }
                 Some(_) => continue,

@@ -24,7 +24,10 @@
   negotiation, request handling in `eth.rs`, Sign-In with Ethereum for
   proposal `requests.authentication` in `auth.rs`, user interaction behind
   the `Ui` trait in `ui.rs` with a plain mode and a ratatui dashboard,
-  Tenderly simulator links for transactions in `tenderly.rs`).
+  Tenderly simulator links for transactions in `tenderly.rs`, WalletConnect
+  Verify (v3 relay attestation JWTs, then v1/v2 hash lookup, mirroring the
+  JS `core` `Verify.resolve`) in `verify.rs`; tests pass `OPWALLET_NO_VERIFY`
+  or a local `OPWALLET_VERIFY_URL` so they never reach the real server).
   `mod.rs` is a multi-session service (any number of pairings and sessions
   on one relay socket); `store.rs` saves settled sessions (keys and public
   data only, `0600`, directory locked) so bare `opwallet` resumes them.

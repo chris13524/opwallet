@@ -87,6 +87,14 @@ struct ServeArgs {
     /// Without it they open in your default Tenderly project.
     #[arg(long, env = "OPWALLET_TENDERLY_PROJECT", value_name = "ACCOUNT/PROJECT")]
     tenderly_project: Option<String>,
+    /// WalletConnect Verify server used to confirm where proposals and
+    /// requests really come from.
+    #[arg(long, env = "OPWALLET_VERIFY_URL", default_value = walletconnect::VERIFY_SERVER)]
+    verify_url: String,
+
+    /// Skip WalletConnect Verify; prompts then show the dapp's claimed URL only.
+    #[arg(long, env = "OPWALLET_NO_VERIFY")]
+    no_verify: bool,
 }
 
 #[derive(Args)]
@@ -440,6 +448,7 @@ fn serve(
         relay_url: args.relay.relay_url,
         rpc_overrides,
         tenderly,
+        verify_server: (!args.no_verify).then_some(args.verify_url),
         metadata: walletconnect::default_metadata(),
         exit_when_idle: plain,
     };

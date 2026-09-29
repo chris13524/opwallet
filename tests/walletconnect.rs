@@ -69,6 +69,26 @@ impl Peer {
         assert_eq!(ack["result"], true);
     }
 
+    /// [`Peer::deliver`] with the Verify attestation `attest` makes for the
+    /// encrypted message.
+    fn deliver_attested(
+        &mut self,
+        topic: &str,
+        key: &SymKey,
+        plaintext: &str,
+        tag: u64,
+        attest: impl Fn(&str) -> String,
+    ) {
+        let message = crypto::encrypt(key, plaintext.as_bytes()).unwrap();
+        let id = 78_000 + tag;
+        self.send_json(json!({
+            "id": id, "jsonrpc": "2.0", "method": "irn_subscription",
+            "params": { "id": "sub", "data": { "topic": topic, "message": message, "publishedAt": 0, "tag": tag, "attestation": attest(&message) } }
+        }));
+        let ack = self.read_json();
+        assert_eq!(ack["id"], id, "expected ack, got {ack}");
+    }
+
     /// Wait for the wallet to publish on `topic`, decrypt and parse it.
     fn expect_publish(&mut self, topic: &str, key: &SymKey, tag: u64) -> Value {
         let params = self.expect_call("irn_publish", json!(true));
@@ -138,6 +158,17 @@ fn spawn_connect_args(
     extra: &[&str],
     answers: &[u8],
 ) -> std::process::Child {
+    spawn_connect_env(fake_op, op_dir, port, extra, answers, &[("OPWALLET_NO_VERIFY", "true")])
+}
+
+fn spawn_connect_env(
+    fake_op: &Path,
+    op_dir: &Path,
+    port: u16,
+    extra: &[&str],
+    answers: &[u8],
+    envs: &[(&str, &str)],
+) -> std::process::Child {
     let mut child = Command::new(env!("CARGO_BIN_EXE_opwallet"))
         .args([
             "connect",
@@ -151,6 +182,7 @@ fn spawn_connect_args(
         .env("OPWALLET_OP_BIN", fake_op)
         .env("FAKE_OP_DIR", op_dir)
         .env("OPWALLET_STATE_DIR", op_dir.join("state"))
+        .envs(envs.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -725,6 +757,7 @@ fn opwallet(fake_op: &Path, op_dir: &Path, args: &[&str], answers: &[u8]) -> std
         .env("FAKE_OP_DIR", op_dir)
         .env("OPWALLET_STATE_DIR", op_dir.join("state"))
         .env("OPWALLET_PROJECT_ID", "test-project")
+        .env("OPWALLET_NO_VERIFY", "true")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -883,5 +916,243 @@ fn sessions_survive_a_restart_and_can_be_disconnected() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("Disconnected PersistDapp"));
     let saved: Value = serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap();
     assert_eq!(saved["sessions"], json!([]));
+    let _ = fs::remove_dir_all(&op_dir);
+}
+
+/// A WalletConnect Verify server answering `routes` (path → JSON body; 404
+/// otherwise). Returns its base URL.
+fn fake_verify_server(routes: Vec<(String, Value)>) -> String {
+    use std::io::{BufRead, BufReader};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            while reader.read_line(&mut String::new()).unwrap() > 2 {}
+            let path = line.split_whitespace().nth(1).unwrap_or("");
+            let (status, body) = match routes.iter().find(|(p, _)| p == path) {
+                Some((_, body)) => (200, body.to_string()),
+                None => (404, "{}".to_string()),
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    base
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(data))
+}
+
+#[test]
+fn shows_walletconnect_verify_results_in_prompts() {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use p256::ecdsa::{Signature as P256Signature, SigningKey, signature::Signer};
+
+    let (fake_op, op_dir) = fake_op_env("verify");
+    let address = create_wallet(&fake_op, &op_dir);
+    let pairing_key = SymKey::from_bytes(*crypto::random_array::<32>().unwrap());
+    let pairing_topic = pairing_key.topic();
+    let uri = format!(
+        "wc:{pairing_topic}@2?relay-protocol=irn&symKey={}",
+        hex::encode(crypto::decrypt_key_bytes_for_test(&pairing_key))
+    );
+
+    // The Verify server's key, and the v1 record of a request sent from a
+    // known scam page rather than the dapp.
+    let verify_key = SigningKey::from_slice(&[0x42; 32]).unwrap();
+    let point = verify_key.verifying_key().to_encoded_point(false);
+    let dapp = KeyPair::generate().unwrap();
+    let sign_req = request_json(
+        1_700_000_000_000_010,
+        "wc_sessionRequest",
+        json!({ "chainId": "eip155:1", "request": { "method": "personal_sign", "params": ["0x68656c6c6f", address] } }),
+    );
+    let verify_url = fake_verify_server(vec![
+        (
+            "/v3/public-key".into(),
+            json!({ "publicKey": { "crv": "P-256", "ext": true, "key_ops": ["verify"], "kty": "EC",
+                "x": URL_SAFE_NO_PAD.encode(point.x().unwrap()), "y": URL_SAFE_NO_PAD.encode(point.y().unwrap()) },
+                "expiresAt": now() + 3600 }),
+        ),
+        (
+            format!("/attestation/{}?v2Supported=true", sha256_hex(sign_req.as_bytes())),
+            json!({ "origin": "https://evil.example", "isScam": true }),
+        ),
+    ]);
+    // A v3 attestation JWT for one encrypted message.
+    let attest = move |message: &str| {
+        let claims = json!({ "exp": now() + 60, "id": sha256_hex(message.as_bytes()),
+            "origin": "https://mock.example", "isScam": false, "isVerified": true });
+        let input = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256","typ":"JWT"}"#),
+            URL_SAFE_NO_PAD.encode(claims.to_string())
+        );
+        let sig: P256Signature = verify_key.sign(input.as_bytes());
+        format!("{input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()))
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let relay_thread = thread::spawn(move || {
+        let stream = accept_with_timeout(&listener);
+        stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        let mut peer = Peer { ws: tungstenite::accept(stream).unwrap() };
+        peer.expect_call("irn_subscribe", json!("sub-pairing"));
+
+        // The proposal carries a valid v3 attestation for mock.example.
+        let proposal = request_json(
+            1_700_000_000_000_001,
+            "wc_sessionPropose",
+            json!({
+                "relays": [{ "protocol": "irn" }],
+                "proposer": { "publicKey": dapp.public_hex(), "metadata": { "name": "MockDapp", "url": "https://mock.example/app", "description": "test", "icons": [] } },
+                "requiredNamespaces": { "eip155": { "chains": ["eip155:1"], "methods": ["personal_sign"], "events": [] } }
+            }),
+        );
+        peer.deliver_attested(&pairing_topic, &pairing_key, &proposal, 1100, attest);
+        let sub = peer.expect_call("irn_subscribe", json!("sub-session"));
+        let session_topic = sub["topic"].as_str().unwrap().to_string();
+        let response = peer.expect_publish(&pairing_topic, &pairing_key, 1101);
+        let responder = response["result"]["responderPublicKey"].as_str().unwrap();
+        let session_key = dapp.derive_session_key(responder).unwrap();
+        peer.expect_publish(&session_topic, &session_key, 1102);
+
+        // The request has no attestation; the v1/v2 lookup flags it.
+        peer.deliver(&session_topic, &session_key, &sign_req, 1108);
+        let res = peer.expect_publish(&session_topic, &session_key, 1109);
+        assert_eq!(res["error"]["code"], 5000, "{res}");
+
+        let bye = request_json(10, "wc_sessionDelete", json!({ "code": 6000, "message": "bye" }));
+        peer.deliver(&session_topic, &session_key, &bye, 1112);
+        peer.expect_publish(&session_topic, &session_key, 1113);
+        peer.expect_call("irn_unsubscribe", json!(true));
+        peer.expect_call("irn_unsubscribe", json!(true));
+    });
+
+    // Approve the verified proposal, decline the flagged request.
+    let child = spawn_connect_env(
+        &fake_op,
+        &op_dir,
+        port,
+        &["--name", "wc", &uri],
+        b"y\nn\n",
+        &[("OPWALLET_NO_VERIFY", "false"), ("OPWALLET_VERIFY_URL", &verify_url)],
+    );
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    relay_thread.join().expect("relay/dapp side failed");
+    assert!(out.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stdout
+            .contains("origin:      https://mock.example (WalletConnect Verify agrees; not proof)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("SCAM WARNING: MockDapp: Sign message"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "DANGER:      WalletConnect Verify flags https://evil.example as a known scam"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "WARNING:     origin mismatch: the dapp claims \"https://mock.example/app\" but \
+             WalletConnect Verify recorded \"https://evil.example\""
+        ),
+        "{stdout}"
+    );
+    let _ = fs::remove_dir_all(&op_dir);
+}
+
+#[test]
+fn alarming_origin_needs_a_second_yes_to_connect() {
+    let (fake_op, op_dir) = fake_op_env("reconfirm");
+    create_wallet(&fake_op, &op_dir);
+    let pairing_key = SymKey::from_bytes(*crypto::random_array::<32>().unwrap());
+    let pairing_topic = pairing_key.topic();
+    let uri = format!(
+        "wc:{pairing_topic}@2?relay-protocol=irn&symKey={}",
+        hex::encode(crypto::decrypt_key_bytes_for_test(&pairing_key))
+    );
+    let dapp = KeyPair::generate().unwrap();
+    let propose = |id: u64| {
+        request_json(
+            id,
+            "wc_sessionPropose",
+            json!({
+                "relays": [{ "protocol": "irn" }],
+                "proposer": { "publicKey": dapp.public_hex(), "metadata": { "name": "MockDapp", "url": "https://mock.example", "description": "test", "icons": [] } },
+                "requiredNamespaces": { "eip155": { "chains": ["eip155:1"], "methods": ["personal_sign"], "events": [] } }
+            }),
+        )
+    };
+    // The first proposal came from a known scam page, the second from a
+    // different site than the dapp claims.
+    let (scam, mismatch) = (propose(1_700_000_000_000_001), propose(1_700_000_000_000_002));
+    let lookup = |p: &str| format!("/attestation/{}?v2Supported=true", sha256_hex(p.as_bytes()));
+    let verify_url = fake_verify_server(vec![
+        (lookup(&scam), json!({ "origin": "https://evil.example", "isScam": true })),
+        (lookup(&mismatch), json!({ "origin": "https://other.example", "isScam": false })),
+    ]);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let relay_thread = thread::spawn(move || {
+        let stream = accept_with_timeout(&listener);
+        stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        let mut peer = Peer { ws: tungstenite::accept(stream).unwrap() };
+        peer.expect_call("irn_subscribe", json!("sub-pairing"));
+
+        // Yes, then no at the second prompt: rejected.
+        peer.deliver(&pairing_topic, &pairing_key, &scam, 1100);
+        let res = peer.expect_publish(&pairing_topic, &pairing_key, 1101);
+        assert_eq!(res["error"]["code"], 5000, "{res}");
+
+        // Yes twice: connected.
+        peer.deliver(&pairing_topic, &pairing_key, &mismatch, 1100);
+        let sub = peer.expect_call("irn_subscribe", json!("sub-session"));
+        let session_topic = sub["topic"].as_str().unwrap().to_string();
+        let response = peer.expect_publish(&pairing_topic, &pairing_key, 1101);
+        let responder = response["result"]["responderPublicKey"].as_str().unwrap();
+        let session_key = dapp.derive_session_key(responder).unwrap();
+        peer.expect_publish(&session_topic, &session_key, 1102);
+
+        let bye = request_json(10, "wc_sessionDelete", json!({ "code": 6000, "message": "bye" }));
+        peer.deliver(&session_topic, &session_key, &bye, 1112);
+        peer.expect_publish(&session_topic, &session_key, 1113);
+        peer.expect_call("irn_unsubscribe", json!(true));
+        peer.expect_call("irn_unsubscribe", json!(true));
+    });
+
+    let child = spawn_connect_env(
+        &fake_op,
+        &op_dir,
+        port,
+        &["--name", "wc", &uri],
+        b"y\nn\ny\ny\n",
+        &[("OPWALLET_NO_VERIFY", "false"), ("OPWALLET_VERIFY_URL", &verify_url)],
+    );
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    relay_thread.join().expect("relay/dapp side failed");
+    assert!(out.status.success(), "{stdout}\n{stderr}");
+    assert!(stdout.contains("SCAM WARNING: Really connect to MockDapp?"), "{stdout}");
+    assert!(stdout.contains("known scam. Connecting lets it ask"), "{stdout}");
+    assert!(stdout.contains("  Really connect to MockDapp?"), "{stdout}");
+    assert!(stdout.contains("recorded a different site than this dapp claims"), "{stdout}");
+    assert!(stdout.contains("Session with MockDapp (https://mock.example)"), "{stdout}");
     let _ = fs::remove_dir_all(&op_dir);
 }

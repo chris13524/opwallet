@@ -92,6 +92,9 @@ pub struct Metadata {
     pub description: String,
     pub url: String,
     pub icons: Vec<String>,
+    /// Verify server the dapp registers its messages with.
+    #[serde(rename = "verifyUrl", skip_serializing_if = "Option::is_none")]
+    pub verify_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

@@ -40,6 +40,7 @@ chacha20poly1305 = "0.10"
 ratatui = "0.30.2"
 crossterm = "0.29.0"
 arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

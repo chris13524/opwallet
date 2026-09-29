@@ -17,6 +17,7 @@ use super::{
     session::RpcError,
     tenderly::{self, SimulationRequest, TenderlyProject},
     ui::{Ui, run_busy},
+    verify::Deferred,
 };
 use crate::wallet::Wallet;
 
@@ -91,11 +92,19 @@ pub struct RequestContext<'a> {
     pub rpc: &'a RpcClient,
     /// Tenderly project that simulation links open in.
     pub tenderly: Option<&'a TenderlyProject>,
+    /// Where the request came from per WalletConnect Verify, shown in prompts.
+    pub verify: Deferred<'a>,
     pub ui: &'a mut dyn Ui,
 }
 
 fn internal(e: anyhow::Error) -> RpcError {
     RpcError::internal(format!("{e:#}"))
+}
+
+/// Ask the user, with the dapp's name and verified origin in front.
+fn confirm(ctx: &mut RequestContext<'_>, title: &str, body: &str) -> Result<bool, RpcError> {
+    let (title, body) = ctx.verify.decorate(ctx.ui, &format!("{}: {title}", ctx.dapp), body);
+    ctx.ui.confirm(&title, &body).map_err(internal)
 }
 
 fn hex_quantity<T: TryFrom<u128>>(v: &Value, name: &str) -> Result<Option<T>, RpcError> {
@@ -292,7 +301,7 @@ fn sign_message(
 
     let title = format!("Sign message ({} bytes) with {}", bytes.len(), account.name);
     let body = format!("account: {}\n\n{}", account.address, truncate(&display, 4000));
-    if !ctx.ui.confirm(&format!("{}: {title}", ctx.dapp), &body).map_err(internal)? {
+    if !confirm(ctx, &title, &body)? {
         return Err(RpcError::user_rejected());
     }
     let sig = with_wallet(ctx, &account, |w| w.sign_message(&bytes))?;
@@ -327,7 +336,7 @@ fn sign_typed_data(params: &Value, ctx: &mut RequestContext<'_>) -> Result<Value
         typed.primary_type,
         truncate(&msg, 4000)
     );
-    if !ctx.ui.confirm(&format!("{}: {title}", ctx.dapp), &body).map_err(internal)? {
+    if !confirm(ctx, &title, &body)? {
         return Err(RpcError::user_rejected());
     }
     let sig = with_wallet(ctx, &account, |w| w.sign_hash(&hash))?;
@@ -570,7 +579,7 @@ fn transaction(
         ctx.ui.copyable(&format!("Tenderly simulation link (eip155:{})", ctx.chain_id), &link);
         body.push_str(&format!("\n\nsimulate this transaction in Tenderly:\n{link}"));
     }
-    if !ctx.ui.confirm(&format!("{}: {title}", ctx.dapp), &body).map_err(internal)? {
+    if !confirm(ctx, &title, &body)? {
         return Err(RpcError::user_rejected());
     }
     let raw = sign_prepared(prepared, ctx, &account)?;
@@ -598,7 +607,7 @@ fn send_raw(params: &Value, ctx: &mut RequestContext<'_>) -> Result<Value, RpcEr
         .ok_or_else(|| RpcError::invalid_params("expected [rawTransaction]"))?;
     let title = format!("Broadcast pre-signed transaction on eip155:{}", ctx.chain_id);
     let body = format!("{} hex characters\n{}", raw.len(), truncate(raw, 2000));
-    if !ctx.ui.confirm(&format!("{}: {title}", ctx.dapp), &body).map_err(internal)? {
+    if !confirm(ctx, &title, &body)? {
         return Err(RpcError::user_rejected());
     }
     let (rpc, chain_id) = (ctx.rpc, ctx.chain_id);

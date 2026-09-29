@@ -22,6 +22,8 @@ signature from an interactive dashboard in your terminal.
     you run `opwallet`, with no need to pair again.
   * **Switch wallets.** Connect several wallets to a dapp, switch the active
     account with one key, and add or remove wallets without reconnecting.
+  * **Origin verification.** WalletConnect Verify warns about mismatches and
+    known scam domains.
 * **Interactive UI or CLI.** A full-screen dashboard for day-to-day use,
   plus plain commands for creating, listing, verifying and signing, and for
   scripts.
@@ -96,6 +98,38 @@ and must be answered `y` or `n`. Use the arrow keys to scroll long messages.
   each sign-in request is shown with its domain, URI, chains and the full
   EIP-4361 message. Each one needs its own `y`. A warning appears when the
   sign-in domain does not match the dapp's URL.
+
+**Origin verification.** A dapp's name and URL are whatever the dapp claims.
+WalletConnect Verify gives a second opinion. The dapp's page registers each
+message with the Verify server, which records the page's origin. Connection
+prompts and every signing prompt start with what it found:
+
+* `origin: https://app.example (WalletConnect Verify agrees; not proof)`:
+  the recorded origin matches the dapp's URL.
+* `WARNING: origin mismatch`: Verify recorded a different site than the
+  dapp claims to be.
+* `DANGER: ... known scam` (and a `SCAM WARNING:` title): Verify flags the
+  origin as malicious. Answer `n`.
+* `origin: unknown`: Verify had no record, for example because the dapp
+  does not use it, runs outside a browser, or the server could not be
+  reached.
+
+A match is not proof. The origin is only as trustworthy as the browser that
+reported it. A scripted or server-side browser, or any client that is not a
+real browser, can register a message under whatever origin it likes. A
+mismatch or a scam flag is worth taking seriously; a match only means
+nothing looked wrong.
+
+Connecting to a dapp with a mismatched or scam origin takes a second
+confirmation (`Really connect to ...?`) after the usual one.
+
+Both ways of resolving it are supported. v3 attestations are signed JWTs
+that the relay attaches to the message, checked against the Verify
+server's P-256 key. v1/v2 records are looked up by message hash. The result
+only informs the prompt; nothing is approved or rejected automatically. The
+lookups send only message hashes to the Verify server, and signing requests
+that are answered without a prompt skip them. Use `--no-verify` to turn it
+off.
 
 ### Simulating with Tenderly
 
@@ -201,6 +235,8 @@ stripped either way). Pass `--name` once per wallet (`--name a --name b`, or
 | `--rpc <chain>=<url>`               |                               | your own JSON-RPC endpoint (repeatable)              |
 | `--tenderly-project <acct/project>` | `OPWALLET_TENDERLY_PROJECT`   | Tenderly project for simulator links                 |
 | `--relay-url <url>`                 | `OPWALLET_RELAY_URL`          | a different WalletConnect relay                      |
+| `--verify-url <url>`                | `OPWALLET_VERIFY_URL`         | a different WalletConnect Verify server              |
+| `--no-verify`                       | `OPWALLET_NO_VERIFY=true`     | skip WalletConnect Verify origin checks              |
 | `--state-dir <dir>`                 | `OPWALLET_STATE_DIR`          | where saved sessions are kept                        |
 
 **Plain mode.** When stdin or stdout is not a terminal, or with `--plain`,

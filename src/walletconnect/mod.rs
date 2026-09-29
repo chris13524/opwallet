@@ -15,6 +15,7 @@ pub mod store;
 pub mod tenderly;
 pub mod ui;
 pub mod uri;
+pub mod verify;
 
 use std::{
     collections::HashMap,
@@ -33,6 +34,7 @@ use store::{SavedState, SessionStore, StoredAccount, StoredSession};
 use ui::{SessionView, Ui, UiAction, WalletRow};
 
 pub use relay::DEFAULT_RELAY_URL;
+pub use verify::VERIFY_SERVER;
 
 /// How long to wait for the dapp's session proposal after pairing.
 const PROPOSAL_TIMEOUT: Duration = Duration::from_secs(300);
@@ -50,6 +52,8 @@ pub struct ServiceOptions {
     pub rpc_overrides: HashMap<u64, String>,
     /// Tenderly project that transaction simulation links open in.
     pub tenderly: Option<tenderly::TenderlyProject>,
+    /// WalletConnect Verify server, or `None` to skip origin verification.
+    pub verify_server: Option<String>,
     pub metadata: Metadata,
     /// Return once no session and no pending pairing is left (plain mode).
     /// The dashboard keeps running until the user quits.
@@ -62,6 +66,7 @@ pub fn default_metadata() -> Metadata {
         description: "CLI wallet with its seed phrase in 1Password".into(),
         url: "https://github.com/chris13524/opwallet".into(),
         icons: vec![],
+        verify_url: None,
     }
 }
 
@@ -370,6 +375,7 @@ struct Service<'a> {
     wallets: &'a dyn Wallets,
     rpc: RpcClient,
     tenderly: Option<tenderly::TenderlyProject>,
+    verifier: verify::Verifier,
     ui: &'a mut dyn Ui,
     exit_when_idle: bool,
 }
@@ -433,6 +439,7 @@ pub fn run(
         wallets,
         rpc: RpcClient::new(&opts.project_id, opts.rpc_overrides),
         tenderly: opts.tenderly,
+        verifier: verify::Verifier::new(opts.verify_server),
         ui,
         exit_when_idle: opts.exit_when_idle,
     };
@@ -935,7 +942,11 @@ impl Service<'_> {
         let text = std::str::from_utf8(&plaintext).context("pairing message is not UTF-8")?;
         let Some(rpc) = parse_rpc(text) else { return Ok(()) };
         match rpc.method.as_deref() {
-            Some("wc_sessionPropose") => self.on_proposal(pi, &rpc),
+            Some("wc_sessionPropose") => {
+                let evidence =
+                    verify::Evidence::new(&inc.message, &plaintext, inc.attestation.clone());
+                self.on_proposal(pi, &rpc, &evidence)
+            }
             Some("wc_pairingPing") => send(
                 &mut self.relay,
                 &topic,
@@ -969,7 +980,7 @@ impl Service<'_> {
         }
     }
 
-    fn on_proposal(&mut self, pi: usize, rpc: &Rpc) -> Result<()> {
+    fn on_proposal(&mut self, pi: usize, rpc: &Rpc, evidence: &verify::Evidence) -> Result<()> {
         let (topic, key) = (self.pairings[pi].topic.clone(), self.pairings[pi].key.clone());
         let accounts = self.pairings[pi].accounts.clone();
         let reply = |relay: &mut Relay, body: &str| {
@@ -999,9 +1010,11 @@ impl Service<'_> {
                 return reply(&mut self.relay, &error_json(rpc.id, &err));
             }
         };
+        let verified = verify::resolve(self.ui, &self.verifier, evidence, meta);
         let mut body = format!(
-            "dapp:        {dapp_name}\nurl:         {}\ndescription: {}\nchains:      {}\nmethods:     {}\n\naccounts:\n",
+            "dapp:        {dapp_name}\nurl:         {}\n{}description: {}\nchains:      {}\nmethods:     {}\n\naccounts:\n",
             meta.url,
+            verified.lines(&meta.url),
             meta.description,
             plan.chains.join(", "),
             plan.methods.join(", ")
@@ -1013,14 +1026,20 @@ impl Service<'_> {
         if auth_count > 0 {
             body.push_str(&format!("\n{auth_count} sign-in request(s) follow after approval.\n"));
         }
-        if !self.ui.confirm(&format!("Session proposal from {dapp_name}"), &body)? {
+        let title = verified.title(&format!("Session proposal from {dapp_name}"));
+        let mut approved = self.ui.confirm(&title, &body)?;
+        // A mismatched or scam origin needs a second, explicit yes.
+        if approved && let Some((title, body)) = verified.reconfirm(&dapp_name, &meta.url) {
+            approved = self.ui.confirm(&title, &body)?;
+        }
+        if !approved {
             reply(&mut self.relay, &error_json(rpc.id, &RpcError::user_rejected()))?;
             self.ui.status("Rejected; still listening for a new proposal on this pairing");
             return Ok(());
         }
 
         let authentication =
-            self.sign_in_requests(&proposal.requests.authentication, meta, &accounts)?;
+            self.sign_in_requests(&proposal.requests.authentication, meta, &verified, &accounts)?;
 
         let keypair = KeyPair::generate()?;
         let session_key = keypair.derive_session_key(&proposal.proposer.public_key)?;
@@ -1091,6 +1110,7 @@ impl Service<'_> {
         &mut self,
         requests: &[auth::AuthPayload],
         dapp: &Metadata,
+        verified: &verify::Context,
         accounts: &[Account],
     ) -> Result<Vec<Value>> {
         let mut approved: Vec<(auth::AuthPayload, Vec<String>)> = Vec::new();
@@ -1101,6 +1121,7 @@ impl Service<'_> {
                 request.domain,
                 request.uri().unwrap_or("<missing>")
             );
+            body.push_str(&verified.lines(&dapp.url));
             if let Some(host) = dapp.url.split("://").nth(1).and_then(|r| r.split('/').next())
                 && !host.is_empty()
                 && host != request.domain
@@ -1156,7 +1177,7 @@ impl Service<'_> {
                 requests.len(),
                 dapp.name
             );
-            if self.ui.confirm(&title, &body)? {
+            if self.ui.confirm(&verified.title(&title), &body)? {
                 approved.push((request.clone(), chains));
             } else {
                 self.ui.log(&format!(
@@ -1246,6 +1267,11 @@ impl Service<'_> {
                     Some(chain_id) => {
                         let s = &mut self.sessions[si];
                         s.last_chain = Some(chain.to_string());
+                        let evidence = verify::Evidence::new(
+                            &inc.message,
+                            &plaintext,
+                            inc.attestation.clone(),
+                        );
                         let mut ctx = RequestContext {
                             dapp: &peer_name,
                             accounts: &s.accounts,
@@ -1254,6 +1280,7 @@ impl Service<'_> {
                             opener: self.wallets,
                             rpc: &self.rpc,
                             tenderly: self.tenderly.as_ref(),
+                            verify: verify::Deferred::new(&self.verifier, evidence, &s.peer),
                             ui: self.ui,
                         };
                         eth::handle(req_method, &req_params, &mut ctx)
