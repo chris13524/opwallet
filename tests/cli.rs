@@ -307,6 +307,16 @@ fn doctor_reports_signed_out() {
 }
 
 #[test]
+fn no_op_account_is_reported_before_op_can_prompt() {
+    let env = Env::new();
+    let out = env.run_with(&["list"], &[("FAKE_OP_NO_ACCOUNTS", "1")]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("no account to use"), "{}", stderr(&out));
+    // Only the account listing ran; op never got a command it would prompt on.
+    assert_eq!(env.calls().trim(), r#"["account", "list", "--format", "json"]"#);
+}
+
+#[test]
 fn missing_op_binary_gives_install_hint() {
     let env = Env::new();
     let out = env.run_with(&["doctor"], &[("OPWALLET_OP_BIN", "/nonexistent/op")]);

@@ -3,7 +3,7 @@
 
 Implements just the subset of `op` that opwallet calls, persisting items as
 JSON files under $FAKE_OP_DIR. Set FAKE_OP_SIGNED_OUT=1 to simulate a locked
-CLI.
+CLI, FAKE_OP_NO_ACCOUNTS=1 for one with no account configured.
 """
 import json, os, stat, sys, uuid
 
@@ -33,6 +33,16 @@ def die(msg, code=1):
     sys.stderr.write("[ERROR] " + msg + "\n")
     sys.exit(code)
 
+
+if os.environ.get("FAKE_OP_NO_ACCOUNTS"):
+    if args[:2] == ["account", "list"]:
+        sys.exit(0)
+    # The real op asks on the terminal whether to add an account.
+    die("No accounts configured for use with 1Password CLI.")
+
+if args[:2] == ["account", "list"]:
+    print(json.dumps([{"url": "my.1password.com", "email": "test@example.com", "user_uuid": "USER", "account_uuid": "ACCT"}]))
+    sys.exit(0)
 
 if os.environ.get("FAKE_OP_SIGNED_OUT"):
     die("You are not currently signed in. Please run `op signin --help`")

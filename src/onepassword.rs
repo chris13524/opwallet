@@ -25,7 +25,7 @@ use std::{
     ffi::OsStr,
     io::{Read, Write},
     process::{Command, Stdio},
-    sync::Mutex,
+    sync::{Mutex, OnceLock},
     thread,
 };
 
@@ -313,11 +313,18 @@ pub struct OpCli {
     relock: bool,
     /// Serialises secret reads so a relock cannot race another read.
     secret_lock: Mutex<()>,
+    /// Set once `op` has been seen to have an account to use.
+    has_account: OnceLock<()>,
 }
 
 impl OpCli {
     pub fn new(binary: impl Into<String>) -> Self {
-        Self { binary: binary.into(), relock: false, secret_lock: Mutex::new(()) }
+        Self {
+            binary: binary.into(),
+            relock: false,
+            secret_lock: Mutex::new(()),
+            has_account: OnceLock::new(),
+        }
     }
 
     /// Sign the CLI out after each secret read (see [`OpCli::relock`]).
@@ -410,9 +417,56 @@ impl OpCli {
         Some(out)
     }
 
+    /// Fail with a clear error when `op` has no account to use.
+    ///
+    /// Without one, `op` does not just fail: it asks on the terminal whether
+    /// to add an account, which garbles the dashboard and hangs, since the
+    /// dashboard owns the keyboard. `op account list` never prompts, so it is
+    /// asked first. Service accounts and Connect servers are configured
+    /// through the environment and have no listed account.
+    fn ensure_account(&self) -> Result<()> {
+        if self.has_account.get().is_some() {
+            return Ok(());
+        }
+        let configured_by_env = ["OP_SERVICE_ACCOUNT_TOKEN", "OP_CONNECT_HOST"]
+            .iter()
+            .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()));
+        if !configured_by_env {
+            // Anything but a definite "no accounts" lets the real command run
+            // and report its own error.
+            let Ok(out) = self.exec(["account", "list", "--format", "json"], None) else {
+                return Ok(());
+            };
+            let text = String::from_utf8_lossy(out.as_bytes());
+            let text = text.trim();
+            let none = text.is_empty()
+                || serde_json::from_str::<Value>(text)
+                    .is_ok_and(|v| v.as_array().is_some_and(Vec::is_empty));
+            if none {
+                bail!(
+                    "the 1Password CLI has no account to use. Open the 1Password desktop app \
+                     and enable Settings > Developer > \"Integrate with 1Password CLI\", or add \
+                     an account with `op account add`, then try again."
+                );
+            }
+        }
+        let _ = self.has_account.set(());
+        Ok(())
+    }
+
     /// Run `op` with `args`, optionally feeding `stdin`, returning stdout in
     /// locked memory.
     fn run<I, S>(&self, args: I, input: Option<Input<'_>>) -> Result<SecretBuf>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.ensure_account()?;
+        self.exec(args, input)
+    }
+
+    /// [`OpCli::run`] without the account check.
+    fn exec<I, S>(&self, args: I, input: Option<Input<'_>>) -> Result<SecretBuf>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
