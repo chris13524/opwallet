@@ -25,8 +25,13 @@ signature from an interactive dashboard in your terminal.
   * **Origin verification.** WalletConnect Verify warns about mismatches and
     known scam domains.
 * **Interactive UI or CLI.** A full-screen dashboard for day-to-day use,
-  plus plain commands for creating, listing, verifying and signing, and for
-  scripts.
+  plus plain commands for creating, listing, verifying and signing
+  messages, typed data and transactions, for scripts and agents.
+* **`wcapp`, the same commands over WalletConnect.** A second binary that
+  pairs with any WalletConnect wallet (including opwallet's dashboard) and
+  takes the same commands and flags, so a script or an agent can be given
+  either one: `opwallet` to sign locally from 1Password, or `wcapp` to ask
+  a wallet, where you approve each request. See [wcapp](#wcapp).
 
 ## Disclaimers
 
@@ -205,6 +210,10 @@ opwallet address --name "Main wallet" # prints the address after verifying it
 opwallet verify  --name "Main wallet" # exit 0 only if phrase ⇔ address
 opwallet sign    --name "Main wallet" --message "hello"      # EIP-191
 opwallet sign    --name "Main wallet" --message 0xdeadbeef   # raw bytes
+opwallet sign-typed-data --name "Main wallet" --data @order.json   # EIP-712 (JSON, @file or -)
+opwallet sign-tx --name "Main wallet" --to 0x... --value 0.1eth    # raw signed tx, not sent
+opwallet send-tx --name "Main wallet" --to 0x... --value 0.1eth --chain 10   # prints the tx hash
+opwallet list --json
 
 # WalletConnect
 opwallet connect                      # dashboard, starting with a new connection
@@ -217,6 +226,13 @@ opwallet disconnect --all
 `create` refuses to reuse an existing item title, never prints the phrase
 unless you pass `--reveal`, and reads the item back from 1Password to confirm
 the round trip before reporting success.
+
+`sign-tx` and `send-tx` fill in whatever you leave out (`--nonce`, `--gas`,
+`--max-fee`/`--priority-fee`, or `--gas-price` for a legacy transaction)
+from the chain, print what they are about to sign to stderr, and then read
+the seed phrase. Amounts are wei unless they carry a unit (`0.1eth`,
+`20gwei`). Like `sign`, they ask nothing beyond the 1Password unlock: there
+is no `y/N` for the transaction's contents.
 
 `connect` takes the `wc:` URI as an argument or at a prompt (quotes are
 stripped either way). Pass `--name` once per wallet (`--name a --name b`, or
@@ -233,6 +249,7 @@ stripped either way). Pass `--name` once per wallet (`--name a --name b`, or
 | `--no-relock`                       | `OPWALLET_NO_RELOCK=1`        | don't run `op signout` after each phrase read        |
 | `--plain`                           |                               | line-based prompts instead of the dashboard          |
 | `--rpc <chain>=<url>`               |                               | your own JSON-RPC endpoint (repeatable)              |
+| `--chain <id>`                      |                               | chain of a `sign-tx` / `send-tx` (default 1)         |
 | `--tenderly-project <acct/project>` | `OPWALLET_TENDERLY_PROJECT`   | Tenderly project for simulator links                 |
 | `--relay-url <url>`                 | `OPWALLET_RELAY_URL`          | a different WalletConnect relay                      |
 | `--verify-url <url>`                | `OPWALLET_VERIFY_URL`         | a different WalletConnect Verify server              |
@@ -254,6 +271,58 @@ again (Touch ID / Windows Hello / system auth) before the next read.
 Otherwise the app keeps the CLI authorized until it locks. Pass `--no-relock`
 to keep the CLI session, for example when you signed in with `op signin` and
 a password instead of the app integration.
+
+## wcapp
+
+`wcapp` is the other end of WalletConnect: a command-line dapp. Pair it
+with a wallet once, and it carries out opwallet's commands by sending them
+to the wallet as requests. The wallet shows each one and you approve or
+reject it there; `wcapp` never holds a key. It works with any WalletConnect
+wallet. With opwallet, run the dashboard (`opwallet`) and approve requests
+in it.
+
+```sh
+export WCAPP_PROJECT_ID=...          # falls back to OPWALLET_PROJECT_ID
+wcapp connect                        # prints a wc: URI (and a QR code); paste it into the wallet
+wcapp connect --chain 1,8453 --no-wait   # print the URI and exit; the next command waits for approval
+wcapp list                           # accounts the wallets share (* = the wallet's active one)
+wcapp address                        # the active account
+wcapp sign -m "hello"                # same flags as opwallet from here on
+wcapp sign-typed-data -d @order.json
+wcapp sign-tx --to 0x... --value 0.1eth --chain 8453
+wcapp send-tx --to 0x... --value 0.1eth
+wcapp doctor                         # is each wallet reachable and answering?
+wcapp sessions
+wcapp disconnect --all
+```
+
+The commands, flags and output are opwallet's, and `tests/parity.rs`
+keeps them that way: given the same input, both programs print the same
+signature, raw transaction or hash. The differences are where the two
+ends differ:
+
+* **`-n` picks an account, not a 1Password item.** It takes an address (or
+  a unique prefix), a number from `wcapp list`, or part of a wallet's name
+  for that wallet's active account. Without it, `wcapp` uses the active
+  account if only one wallet is connected.
+* **Approval happens in the wallet.** Every command waits for the wallet's
+  answer, up to `--timeout` (default 300 seconds). Requests carry that
+  expiry, and opwallet refuses to act on one that has expired, even if you
+  approve it afterwards, so a timed-out command is never carried out later
+  behind the caller's back.
+* **Exit status 2 means the wallet refused** (you said no, or the request
+  expired in the wallet). Anything else that fails exits 1.
+* **The wallet talks to the chain.** `wcapp` has no `--rpc`; the wallet
+  fills in missing fields and broadcasts. A transaction must be on a chain
+  the session has; pair with `--chain` to get others.
+* **One command at a time.** Commands run one at a time; a second one waits
+  for the first to finish.
+
+`wcapp` keeps its sessions in `dapp-sessions.json` in its own state
+directory (`~/.local/state/wcapp`, `~/Library/Application Support/wcapp` on
+macOS, or `--state-dir` / `WCAPP_STATE_DIR`): session keys, the wallets'
+metadata and their public addresses. Every option has a `WCAPP_` variable
+(`WCAPP_NAME`, `WCAPP_TIMEOUT`, `WCAPP_RELAY_URL`, ...).
 
 ## How it talks to 1Password
 
@@ -337,6 +406,9 @@ this for debugging the tool itself.
 * Requests are rejected before you are prompted if they name an account that
   isn't connected, use a chain the session did not approve, or carry a
   `chainId` that disagrees with the session.
+* A request carrying an `expiryTimestamp` that has passed is refused, and a
+  request that expires while its prompt is open is refused even after a
+  `y`: the dapp has stopped waiting and may already have retried.
 * `eth_sign` is treated exactly like `personal_sign` (EIP-191 prefix), so a
   dapp cannot trick you into signing a raw transaction hash.
 * The relay only ever sees ChaCha20-Poly1305 ciphertext. The relay connection
@@ -395,3 +467,8 @@ The end-to-end tests run the real binary against a small Python stand-in for
 sent to and parsed from 1Password. `tests/walletconnect.rs` plays both relay
 and dapp over a local websocket and checks every signature the wallet
 returns, including a two-wallet session driven entirely through the prompts.
+`tests/wcapp.rs` runs `wcapp` against `opwallet` through a small relay with
+a mailbox, and checks that each command gives the same output through the
+wallet as it does locally. `tests/parity.rs` fails when a command or flag
+is added to one program but not the other, unless the difference is listed
+there.

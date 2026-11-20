@@ -16,7 +16,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use zeroize::{Zeroize, Zeroizing};
 
 use super::session::Metadata;
@@ -92,6 +92,11 @@ impl Drop for SavedState {
 
 /// Where state lives when `--state-dir` / `OPWALLET_STATE_DIR` is not given.
 pub fn default_dir() -> Result<PathBuf> {
+    default_dir_for("opwallet")
+}
+
+/// The default state directory of the program called `app`.
+pub fn default_dir_for(app: &str) -> Result<PathBuf> {
     let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
     let base = if cfg!(target_os = "macos") {
         var("HOME").map(|h| h.join("Library/Application Support"))
@@ -100,21 +105,27 @@ pub fn default_dir() -> Result<PathBuf> {
     } else {
         var("XDG_STATE_HOME").or_else(|| var("HOME").map(|h| h.join(".local/state")))
     };
-    base.map(|b| b.join("opwallet"))
+    base.map(|b| b.join(app))
         .ok_or_else(|| anyhow::anyhow!("cannot find a home directory; pass --state-dir"))
+}
+
+/// Read `file` in `dir` as JSON; `None` when it does not exist yet.
+pub fn read_json<T: DeserializeOwned>(dir: &Path, file: &str) -> Result<Option<T>> {
+    let path = dir.join(file);
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => Zeroizing::new(t),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("could not read {}", path.display())),
+    };
+    serde_json::from_str(&text).map(Some).with_context(|| {
+        format!("{} is corrupt; delete it to forget all saved sessions", path.display())
+    })
 }
 
 /// Read the saved sessions without taking the lock (for listings).
 pub fn read(dir: &Path) -> Result<SavedState> {
     let path = dir.join(STATE_FILE);
-    let text = match fs::read_to_string(&path) {
-        Ok(t) => Zeroizing::new(t),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SavedState::default()),
-        Err(e) => return Err(e).with_context(|| format!("could not read {}", path.display())),
-    };
-    let state: SavedState = serde_json::from_str(&text).with_context(|| {
-        format!("{} is corrupt; delete it to forget all saved sessions", path.display())
-    })?;
+    let state: SavedState = read_json(dir, STATE_FILE)?.unwrap_or_default();
     if state.version > VERSION {
         bail!("{} was written by a newer opwallet (version {})", path.display(), state.version);
     }
@@ -130,14 +141,7 @@ pub struct SessionStore {
 impl SessionStore {
     /// Create the directory if needed and take its lock.
     pub fn open(dir: &Path) -> Result<Self> {
-        create_private_dir(dir)?;
-        let lock_path = dir.join(LOCK_FILE);
-        let lock = File::options()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_path)
-            .with_context(|| format!("could not open {}", lock_path.display()))?;
+        let (lock, lock_path) = open_lock(dir)?;
         lock_exclusive(&lock).with_context(|| {
             format!(
                 "another opwallet is already serving the saved sessions (it holds {}); \
@@ -145,6 +149,18 @@ impl SessionStore {
                 lock_path.display()
             )
         })?;
+        Ok(Self { dir: dir.to_path_buf(), _lock: lock })
+    }
+
+    /// Like [`SessionStore::open`], but wait for whoever holds the lock to
+    /// let go (calling `waiting` first) instead of failing.
+    pub fn open_waiting(dir: &Path, waiting: impl FnOnce()) -> Result<Self> {
+        let (lock, lock_path) = open_lock(dir)?;
+        if lock_exclusive(&lock).is_err() {
+            waiting();
+            lock_blocking(&lock)
+                .with_context(|| format!("could not lock {}", lock_path.display()))?;
+        }
         Ok(Self { dir: dir.to_path_buf(), _lock: lock })
     }
 
@@ -158,13 +174,21 @@ impl SessionStore {
 
     /// Replace the state file atomically (write a private temp file, rename).
     pub fn save(&self, state: &SavedState) -> Result<()> {
-        let path = self.dir.join(STATE_FILE);
-        let tmp = self.dir.join(format!("{STATE_FILE}.tmp"));
-        let mut body = Zeroizing::new(serde_json::to_string_pretty(&SavedStateRef {
-            version: VERSION,
-            relay_key: state.relay_key.as_deref(),
-            sessions: &state.sessions,
-        })?);
+        self.save_json(
+            STATE_FILE,
+            &SavedStateRef {
+                version: VERSION,
+                relay_key: state.relay_key.as_deref(),
+                sessions: &state.sessions,
+            },
+        )
+    }
+
+    /// Replace `file` in the directory with `value` as JSON, atomically.
+    pub fn save_json<T: Serialize>(&self, file: &str, value: &T) -> Result<()> {
+        let path = self.dir.join(file);
+        let tmp = self.dir.join(format!("{file}.tmp"));
+        let mut body = Zeroizing::new(serde_json::to_string_pretty(value)?);
         body.push('\n');
         let _ = fs::remove_file(&tmp);
         let mut file = private_file(&tmp)?;
@@ -181,6 +205,18 @@ struct SavedStateRef<'a> {
     version: u32,
     relay_key: Option<&'a str>,
     sessions: &'a [StoredSession],
+}
+
+fn open_lock(dir: &Path) -> Result<(File, PathBuf)> {
+    create_private_dir(dir)?;
+    let lock_path = dir.join(LOCK_FILE);
+    let lock = File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("could not open {}", lock_path.display()))?;
+    Ok((lock, lock_path))
 }
 
 #[cfg(unix)]
@@ -239,6 +275,26 @@ fn lock_exclusive(file: &File) -> Result<()> {
 #[cfg(not(unix))]
 fn lock_exclusive(file: &File) -> Result<()> {
     file.try_lock().map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+#[cfg(unix)]
+fn lock_blocking(file: &File) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    loop {
+        // SAFETY: as in `lock_exclusive`, blocking this time.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(());
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(e.into());
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn lock_blocking(file: &File) -> Result<()> {
+    file.lock().map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 #[cfg(test)]
@@ -302,7 +358,18 @@ mod tests {
             let err = SessionStore::open(&dir).err().unwrap();
             assert!(format!("{err:#}").contains("already serving"), "{err:#}");
         }
+        // A waiting opener gets the lock once the holder lets go.
+        let waited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (flag, d) = (waited.clone(), dir.clone());
+        let waiter = std::thread::spawn(move || {
+            SessionStore::open_waiting(&d, || flag.store(true, std::sync::atomic::Ordering::SeqCst))
+                .map(|_| ())
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
         drop(store);
+        waiter.join().unwrap().unwrap();
+        #[cfg(unix)]
+        assert!(waited.load(std::sync::atomic::Ordering::SeqCst), "it was told it had to wait");
         assert!(SessionStore::open(&dir).is_ok(), "lock is released on drop");
         let _ = fs::remove_dir_all(&dir);
     }

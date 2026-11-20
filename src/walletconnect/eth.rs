@@ -65,6 +65,12 @@ impl RpcClient {
     }
 
     pub fn call(&self, chain_id: u64, method: &str, params: Value) -> Result<Value> {
+        if self.project_id.is_empty() && !self.overrides.contains_key(&chain_id) {
+            bail!(
+                "{method} needs a JSON-RPC endpoint for chain {chain_id}: pass \
+                 --rpc {chain_id}=URL or a WalletConnect project ID"
+            );
+        }
         let url = self.url(chain_id);
         let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
         let mut response = self
@@ -94,7 +100,26 @@ pub struct RequestContext<'a> {
     pub tenderly: Option<&'a TenderlyProject>,
     /// Where the request came from per WalletConnect Verify, shown in prompts.
     pub verify: Deferred<'a>,
+    /// Unix time after which the dapp no longer waits for an answer
+    /// (`request.expiryTimestamp`). Approving after it would act on a
+    /// request whose sender has given up and may already have retried.
+    pub expiry: Option<u64>,
     pub ui: &'a mut dyn Ui,
+}
+
+/// Sign API error code for a request that expired.
+pub const ERR_REQUEST_EXPIRED: i64 = 8000;
+
+fn expired(expiry: Option<u64>) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    expiry.is_some_and(|e| e <= now)
+}
+
+fn expired_error() -> RpcError {
+    RpcError::new(ERR_REQUEST_EXPIRED, "Request expired before it was approved.")
 }
 
 fn internal(e: anyhow::Error) -> RpcError {
@@ -102,9 +127,19 @@ fn internal(e: anyhow::Error) -> RpcError {
 }
 
 /// Ask the user, with the dapp's name and verified origin in front.
+/// A request that expires while the prompt is open is refused even if the
+/// user says yes.
 fn confirm(ctx: &mut RequestContext<'_>, title: &str, body: &str) -> Result<bool, RpcError> {
+    if expired(ctx.expiry) {
+        return Err(expired_error());
+    }
     let (title, body) = ctx.verify.decorate(ctx.ui, &format!("{}: {title}", ctx.dapp), body);
-    ctx.ui.confirm(&title, &body).map_err(internal)
+    let approved = ctx.ui.confirm(&title, &body).map_err(internal)?;
+    if approved && expired(ctx.expiry) {
+        ctx.ui.warn(&format!("{}: the request expired while waiting; not signing", ctx.dapp));
+        return Err(expired_error());
+    }
+    Ok(approved)
 }
 
 fn hex_quantity<T: TryFrom<u128>>(v: &Value, name: &str) -> Result<Option<T>, RpcError> {
@@ -308,14 +343,9 @@ fn sign_message(
     Ok(json!(sig))
 }
 
-fn sign_typed_data(params: &Value, ctx: &mut RequestContext<'_>) -> Result<Value, RpcError> {
-    let list =
-        params.as_array().ok_or_else(|| RpcError::invalid_params("params must be an array"))?;
-    let (addr, data) = match list.as_slice() {
-        [a, d] => (parse_address(&json!({ "a": a }), "a")?, d),
-        _ => return Err(RpcError::invalid_params("expected [address, typedData]")),
-    };
-    let account = resolve_account(ctx, addr)?.clone();
+/// EIP-712 typed data (a JSON object, or a string holding one), parsed and
+/// hashed: returns the JSON object, its primary type and the digest to sign.
+pub fn typed_data_digest(data: &Value) -> Result<(Value, String, B256), RpcError> {
     let data: Value = match data {
         Value::String(s) => serde_json::from_str(s)
             .map_err(|e| RpcError::invalid_params(format!("typed data is not valid JSON: {e}")))?,
@@ -326,6 +356,23 @@ fn sign_typed_data(params: &Value, ctx: &mut RequestContext<'_>) -> Result<Value
     let hash: B256 = typed
         .eip712_signing_hash()
         .map_err(|e| RpcError::invalid_params(format!("cannot hash typed data: {e}")))?;
+    Ok((data, typed.primary_type, hash))
+}
+
+/// Hex signature over EIP-712 typed data, as `eth_signTypedData_v4` returns it.
+pub fn sign_typed_digest(wallet: &Wallet, hash: &B256) -> Result<String> {
+    Ok(hex::encode_prefixed(wallet.sign_hash(hash)?.as_bytes()))
+}
+
+fn sign_typed_data(params: &Value, ctx: &mut RequestContext<'_>) -> Result<Value, RpcError> {
+    let list =
+        params.as_array().ok_or_else(|| RpcError::invalid_params("params must be an array"))?;
+    let (addr, data) = match list.as_slice() {
+        [a, d] => (parse_address(&json!({ "a": a }), "a")?, d),
+        _ => return Err(RpcError::invalid_params("expected [address, typedData]")),
+    };
+    let account = resolve_account(ctx, addr)?.clone();
+    let (data, primary_type, hash) = typed_data_digest(data)?;
 
     let msg = serde_json::to_string_pretty(&data["message"]).unwrap_or_default();
     let title = format!("Sign EIP-712 typed data with {}", account.name);
@@ -333,26 +380,30 @@ fn sign_typed_data(params: &Value, ctx: &mut RequestContext<'_>) -> Result<Value
         "account:      {}\ndomain:       {}\nprimary type: {}\nmessage:\n{}\ndigest:       {hash}",
         account.address,
         truncate(&data["domain"].to_string(), 500),
-        typed.primary_type,
+        primary_type,
         truncate(&msg, 4000)
     );
     if !confirm(ctx, &title, &body)? {
         return Err(RpcError::user_rejected());
     }
-    let sig = with_wallet(ctx, &account, |w| w.sign_hash(&hash))?;
-    Ok(json!(hex::encode_prefixed(sig.as_bytes())))
+    let sig = with_wallet(ctx, &account, |w| sign_typed_digest(w, &hash))?;
+    Ok(json!(sig))
 }
 
-enum Prepared {
+/// A transaction with every field filled in, ready to sign.
+pub enum Prepared {
     Legacy(TxLegacy),
     Eip1559(TxEip1559),
 }
 
-fn prepare_transaction(
+/// Turn an `eth_sendTransaction`-style object into a complete transaction
+/// from `from_addr`, asking the chain for whatever it leaves out (nonce, gas
+/// limit, fees).
+pub fn prepare_transaction(
     tx: &Value,
     rpc: &RpcClient,
     chain_id: u64,
-    account: &Account,
+    from_addr: Address,
 ) -> Result<Prepared, RpcError> {
     let to = parse_address(tx, "to")?;
     let value: U256 = match tx.get("value") {
@@ -378,8 +429,6 @@ fn prepare_transaction(
             chain_id
         )));
     }
-    let from_addr = account.address;
-
     let nonce: u64 = match hex_quantity(tx, "nonce")? {
         Some(n) => n,
         None => {
@@ -474,7 +523,8 @@ fn prepare_transaction(
     }))
 }
 
-fn describe(p: &Prepared, chain_id: u64, from: &Account) -> String {
+/// What a prepared transaction does, for an approval prompt.
+pub fn describe(p: &Prepared, chain_id: u64, from: &Account) -> String {
     let (nonce, gas, to, value, input, fee_line, max_fee) = match p {
         Prepared::Legacy(t) => (
             t.nonce,
@@ -536,14 +586,9 @@ fn tenderly_link(p: &Prepared, from: Address, project: Option<&TenderlyProject>)
     Some(tenderly::simulator_link(&req, project))
 }
 
-fn sign_prepared(
-    p: Prepared,
-    ctx: &mut RequestContext<'_>,
-    account: &Account,
-) -> Result<Vec<u8>, RpcError> {
-    let mut sign = |hash: B256| -> Result<Signature, RpcError> {
-        with_wallet(ctx, account, |w| w.sign_hash(&hash))
-    };
+/// Sign a prepared transaction: the EIP-2718 encoded raw transaction.
+pub fn sign_transaction(p: Prepared, wallet: &Wallet) -> Result<Vec<u8>> {
+    let sign = |hash: B256| -> Result<Signature> { wallet.sign_hash(&hash) };
     let envelope: TxEnvelope = match p {
         Prepared::Legacy(t) => {
             let sig = sign(t.signature_hash())?;
@@ -555,6 +600,14 @@ fn sign_prepared(
         }
     };
     Ok(envelope.encoded_2718())
+}
+
+fn sign_prepared(
+    p: Prepared,
+    ctx: &mut RequestContext<'_>,
+    account: &Account,
+) -> Result<Vec<u8>, RpcError> {
+    with_wallet(ctx, account, |w| sign_transaction(p, w))
 }
 
 fn transaction(
@@ -570,7 +623,7 @@ fn transaction(
     let account = resolve_account(ctx, parse_address(tx, "from")?)?.clone();
     let (rpc, chain_id) = (ctx.rpc, ctx.chain_id);
     let prepared = run_busy(ctx.ui, "Fetching nonce, gas and fees from the chain", || {
-        prepare_transaction(tx, rpc, chain_id, &account)
+        prepare_transaction(tx, rpc, chain_id, account.address)
     })?;
     let verb = if broadcast { "Send" } else { "Sign" };
     let title = format!("{verb} transaction from {}", account.name);

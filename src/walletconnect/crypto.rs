@@ -103,6 +103,23 @@ impl KeyPair {
         Ok(Self { secret, public })
     }
 
+    /// Restore a key pair saved with [`KeyPair::secret_hex`].
+    pub fn from_secret_hex(hex: &str) -> Result<Self> {
+        let bytes = Zeroizing::new(
+            alloy_primitives::hex::decode(hex).context("private key is not valid hex")?,
+        );
+        let seed: [u8; 32] =
+            bytes.as_slice().try_into().map_err(|_| anyhow!("private key must be 32 bytes"))?;
+        let secret = StaticSecret::from(seed);
+        let public = PublicKey::from(&secret);
+        Ok(Self { secret, public })
+    }
+
+    /// The private key, hex, for a pairing that outlives this process.
+    pub fn secret_hex(&self) -> Zeroizing<String> {
+        Zeroizing::new(alloy_primitives::hex::encode(self.secret.to_bytes()))
+    }
+
     pub fn public_hex(&self) -> String {
         alloy_primitives::hex::encode(self.public.as_bytes())
     }
@@ -155,6 +172,9 @@ mod tests {
         assert_eq!(ka.topic(), kb.topic());
         assert_eq!(ka.topic().len(), 64);
         assert!(a.derive_session_key("zz").is_err());
+        let restored = KeyPair::from_secret_hex(&a.secret_hex()).unwrap();
+        assert_eq!(restored.public_hex(), a.public_hex());
+        assert!(KeyPair::from_secret_hex("abcd").is_err());
     }
 
     #[test]

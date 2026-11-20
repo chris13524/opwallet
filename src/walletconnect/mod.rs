@@ -8,6 +8,7 @@
 
 pub mod auth;
 pub mod crypto;
+pub mod dapp;
 pub mod eth;
 pub mod relay;
 pub mod session;
@@ -1281,6 +1282,7 @@ impl Service<'_> {
                             rpc: &self.rpc,
                             tenderly: self.tenderly.as_ref(),
                             verify: verify::Deferred::new(&self.verifier, evidence, &s.peer),
+                            expiry: request.get("expiryTimestamp").and_then(Value::as_u64),
                             ui: self.ui,
                         };
                         eth::handle(req_method, &req_params, &mut ctx)
@@ -1395,31 +1397,42 @@ pub fn disconnect_saved(
 /// Resolve a session selector from `opwallet disconnect`: a 1-based number
 /// from `opwallet sessions`, a topic prefix, or part of the dapp's name or URL.
 pub fn select_saved(sessions: &[StoredSession], selector: &str) -> Result<usize> {
+    let entries: Vec<(&str, &str, &str)> = sessions
+        .iter()
+        .map(|s| (s.topic.as_str(), s.peer.name.as_str(), s.peer.url.as_str()))
+        .collect();
+    select_session(&entries, selector, "opwallet sessions")
+}
+
+/// [`select_saved`] over any list of `(topic, peer name, peer URL)`;
+/// `listing` names the command that numbers them.
+pub fn select_session(
+    entries: &[(&str, &str, &str)],
+    selector: &str,
+    listing: &str,
+) -> Result<usize> {
     let sel = selector.trim();
     if let Ok(n) = sel.parse::<usize>() {
-        if n == 0 || n > sessions.len() {
-            bail!("no saved session number {n}; see `opwallet sessions`");
+        if n == 0 || n > entries.len() {
+            bail!("no saved session number {n}; see `{listing}`");
         }
         return Ok(n - 1);
     }
     let lower = sel.to_lowercase();
-    let matches: Vec<usize> = sessions
+    let matches: Vec<usize> = entries
         .iter()
         .enumerate()
-        .filter(|(_, s)| {
-            (sel.len() >= 6 && s.topic.starts_with(sel))
-                || s.peer.name.to_lowercase().contains(&lower)
-                || s.peer.url.to_lowercase().contains(&lower)
+        .filter(|(_, (topic, name, url))| {
+            (sel.len() >= 6 && topic.starts_with(sel))
+                || name.to_lowercase().contains(&lower)
+                || url.to_lowercase().contains(&lower)
         })
         .map(|(i, _)| i)
         .collect();
     match matches.as_slice() {
         [i] => Ok(*i),
-        [] => bail!("no saved session matches {sel:?}; see `opwallet sessions`"),
-        _ => bail!(
-            "{sel:?} matches {} sessions; use its number from `opwallet sessions`",
-            matches.len()
-        ),
+        [] => bail!("no saved session matches {sel:?}; see `{listing}`"),
+        _ => bail!("{sel:?} matches {} sessions; use its number from `{listing}`", matches.len()),
     }
 }
 

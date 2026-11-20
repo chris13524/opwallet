@@ -414,3 +414,128 @@ fn bare_invocation_without_a_terminal_serves_saved_sessions_only() {
     let out = env.run(&["disconnect", "nope"]);
     assert!(stderr(&out).contains("no saved session matches"), "{}", stderr(&out));
 }
+
+const TYPED_DATA: &str = r#"{"types":{"EIP712Domain":[{"name":"name","type":"string"},{"name":"chainId","type":"uint256"}],"Note":[{"name":"text","type":"string"}]},"primaryType":"Note","domain":{"name":"Test","chainId":1},"message":{"text":"hi"}}"#;
+
+/// `op item get` calls that fetched a whole item (so its seed phrase),
+/// rather than only the public address field.
+fn seed_reads(env: &Env) -> usize {
+    env.calls()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Vec<String>>(l).ok())
+        .filter(|c| c.starts_with(&["item".into(), "get".into()]))
+        .filter(|c| !c.iter().any(|a| a == "label=wallet address"))
+        .count()
+}
+
+#[test]
+fn sign_typed_data_signs_the_eip712_digest() {
+    use alloy_dyn_abi::TypedData;
+    use alloy_primitives::{Signature, hex};
+    let env = Env::new();
+    assert!(env.run(&["create", "--name", "w"]).status.success());
+    let address: alloy_primitives::Address =
+        field(&env.items()[0], "wallet address").parse().unwrap();
+
+    let out = env.run(&["sign-typed-data", "-n", "w", "--data", TYPED_DATA]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let typed: TypedData = serde_json::from_str(TYPED_DATA).unwrap();
+    let digest = typed.eip712_signing_hash().unwrap();
+    let sig = Signature::from_raw(&hex::decode(stdout(&out).trim()).unwrap()).unwrap();
+    assert_eq!(sig.recover_address_from_prehash(&digest).unwrap(), address);
+
+    // From a file, too; malformed typed data is refused before the seed is read.
+    // Not in the fake op's directory, which treats every .json as an item.
+    fs::create_dir_all(env.dir.join("files")).unwrap();
+    let file = env.dir.join("files/typed.json");
+    fs::write(&file, TYPED_DATA).unwrap();
+    let out = env.run(&["sign-typed-data", "-n", "w", "-d", &format!("@{}", file.display())]);
+    assert_eq!(stdout(&out).trim(), hex::encode_prefixed(sig.as_bytes()), "{}", stderr(&out));
+    let _ = fs::remove_file(env.dir.join("calls.log"));
+    let out = env.run(&["sign-typed-data", "-n", "w", "-d", r#"{"types":{}}"#]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("typed data"), "{}", stderr(&out));
+    assert_eq!(seed_reads(&env), 0, "{}", env.calls());
+}
+
+#[test]
+fn sign_tx_builds_signs_and_never_needs_the_chain_when_every_field_is_given() {
+    use alloy_consensus::{Transaction, TxEnvelope, transaction::SignableTransaction};
+    use alloy_eips::eip2718::Decodable2718;
+    use alloy_primitives::{U256, hex};
+    let env = Env::new();
+    assert!(env.run(&["create", "--name", "w"]).status.success());
+    let address: alloy_primitives::Address =
+        field(&env.items()[0], "wallet address").parse().unwrap();
+    let to = "0x00000000000000000000000000000000000000bb";
+
+    let common = ["-n", "w", "--to", to, "--nonce", "3", "--gas", "21000"];
+    let out = env.run(
+        &[
+            &["sign-tx", "--chain", "10", "--value", "0.5eth"][..],
+            &common,
+            &["--max-fee", "30gwei", "--priority-fee", "1gwei"],
+        ]
+        .concat(),
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stderr(&out).contains("chain:     eip155:10"), "summary on stderr: {}", stderr(&out));
+    let raw = hex::decode(stdout(&out).trim()).unwrap();
+    let TxEnvelope::Eip1559(signed) = TxEnvelope::decode_2718(&mut raw.as_slice()).unwrap() else {
+        panic!("expected an EIP-1559 transaction")
+    };
+    let tx = signed.tx();
+    assert_eq!((tx.chain_id, tx.nonce, tx.gas_limit), (10, 3, 21_000));
+    assert_eq!(tx.value, U256::from(500_000_000_000_000_000u128));
+    assert_eq!((tx.max_fee_per_gas, tx.max_priority_fee_per_gas), (30_000_000_000, 1_000_000_000));
+    assert_eq!(tx.to().unwrap().to_string().to_lowercase(), to);
+    let signer = signed.signature().recover_address_from_prehash(&tx.signature_hash()).unwrap();
+    assert_eq!(signer, address);
+
+    // --gas-price makes it a legacy transaction.
+    let out = env.run(&[&["sign-tx"][..], &common, &["--gas-price", "2gwei"]].concat());
+    assert!(out.status.success(), "{}", stderr(&out));
+    let raw = hex::decode(stdout(&out).trim()).unwrap();
+    let envelope = TxEnvelope::decode_2718(&mut raw.as_slice()).unwrap();
+    assert!(matches!(envelope, TxEnvelope::Legacy(_)), "{envelope:?}");
+    assert_eq!(envelope.chain_id(), Some(1));
+}
+
+#[test]
+fn sign_tx_that_needs_the_chain_says_so_before_reading_the_seed() {
+    let env = Env::new();
+    assert!(env.run(&["create", "--name", "w"]).status.success());
+    let _ = fs::remove_file(env.dir.join("calls.log"));
+    // No nonce, no --rpc, no project ID: nothing to ask the chain with.
+    let out =
+        env.run(&["send-tx", "-n", "w", "--to", "0x00000000000000000000000000000000000000bb"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("--rpc 1=URL"), "{}", stderr(&out));
+    assert_eq!(seed_reads(&env), 0, "the seed is read only to sign: {}", env.calls());
+
+    let out = env.run(&["sign-tx", "-n", "w", "--value", "1.5"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("1.5eth"), "a bare fraction suggests a unit: {}", stderr(&out));
+    let out = env.run(&["sign-tx", "-n", "w", "--gas-price", "1", "--max-fee", "1"]);
+    assert!(!out.status.success(), "legacy and EIP-1559 fees conflict");
+}
+
+#[test]
+fn list_and_sessions_print_json() {
+    let env = Env::new();
+    let out = env.run(&["list", "--json"]);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stdout(&out)).unwrap(),
+        serde_json::json!([])
+    );
+    assert!(env.run(&["create", "--name", "w"]).status.success());
+    let out = env.run(&["list", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(v[0]["name"], "w");
+    assert_eq!(v[0]["address"], field(&env.items()[0], "wallet address"));
+    let out = env.run(&["sessions", "--json"]);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stdout(&out)).unwrap(),
+        serde_json::json!([])
+    );
+}

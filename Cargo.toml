@@ -2,13 +2,17 @@
 name = "opwallet"
 version = "0.1.0"
 edition = "2024"
-description = "A CLI crypto wallet that keeps its seed phrase in 1Password"
+description = "A CLI crypto wallet that keeps its seed phrase in 1Password, and wcapp, its WalletConnect counterpart"
 license = "MIT"
 repository = "https://github.com/chris13524/opwallet"
 
 [[bin]]
 name = "opwallet"
 path = "src/main.rs"
+
+[[bin]]
+name = "wcapp"
+path = "src/bin/wcapp.rs"
 
 [dependencies]
 alloy-primitives = "1.7.3"
@@ -41,6 +45,7 @@ ratatui = "0.30.2"
 crossterm = "0.29.0"
 arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+qrcode = { version = "0.15", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

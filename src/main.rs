@@ -1,193 +1,33 @@
 //! `opwallet`: a CLI Ethereum wallet whose only copy of the seed lives in
 //! 1Password.
 
-use std::{path::PathBuf, process::ExitCode};
+use std::process::ExitCode;
 
-use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
+use alloy_primitives::{Address, hex};
+use anyhow::{Context, Result, anyhow, bail};
 use opwallet::{
+    cli::{
+        self, DisconnectArgs, OutputArgs, RelayArgs, TxArgs,
+        opwallet::{ChainArgs, Cli, Commands, ENV_PREFIX, ServeArgs},
+    },
     harden,
     onepassword::{self, ItemRef, NewWallet, OpCli, SecretStore, StoredWallet, WalletSummary},
     wallet::{self, DEFAULT_DERIVATION_PATH, Wallet},
     walletconnect::{
         self,
-        eth::{Account, Opener},
+        eth::{self, Account, Opener, RpcClient},
+        session::RpcError,
         store::{self, SessionStore},
         ui::{self, Ui},
     },
 };
-
-#[derive(Parser)]
-#[command(
-    name = "opwallet",
-    version,
-    about = "Ethereum wallet with its seed phrase stored in 1Password",
-    long_about = "Ethereum wallet with its seed phrase stored in 1Password.\n\n\
-        Uses the 1Password CLI (`op`) which unlocks through the locally running \
-        1Password desktop app. Enable Settings > Developer > \"Integrate with 1Password CLI\" \
-        in the app first.\n\n\
-        Run without a command to open the dashboard: saved WalletConnect sessions, \
-        connecting more dapps, adding and removing wallets on a session, and \
-        generating new wallets."
-)]
-struct Cli {
-    /// Path to the 1Password CLI binary.
-    #[arg(long, global = true, env = "OPWALLET_OP_BIN", default_value = "op")]
-    op_bin: String,
-
-    /// 1Password vault to use (name or ID). Defaults to op's default vault.
-    #[arg(long, global = true, env = "OPWALLET_VAULT")]
-    vault: Option<String>,
-
-    /// Keep the 1Password CLI signed in after reading a seed phrase.
-    /// By default the CLI is signed out after every read, so the next read
-    /// needs a fresh unlock (Touch ID / system auth) in the desktop app.
-    #[arg(long, global = true, env = "OPWALLET_NO_RELOCK")]
-    no_relock: bool,
-
-    /// Directory for saved WalletConnect sessions
-    /// (default: ~/.local/state/opwallet, ~/Library/Application Support/opwallet on macOS).
-    #[arg(long, global = true, env = "OPWALLET_STATE_DIR")]
-    state_dir: Option<PathBuf>,
-
-    #[command(flatten)]
-    serve: ServeArgs,
-
-    #[command(subcommand)]
-    command: Option<Commands>,
-}
-
-#[derive(Args)]
-struct RelayArgs {
-    /// WalletConnect project ID (free at https://dashboard.walletconnect.com).
-    #[arg(long, env = "OPWALLET_PROJECT_ID")]
-    project_id: Option<String>,
-
-    /// Relay websocket URL.
-    #[arg(long, env = "OPWALLET_RELAY_URL", default_value = walletconnect::DEFAULT_RELAY_URL)]
-    relay_url: String,
-}
-
-#[derive(Args)]
-struct ServeArgs {
-    /// Line-based prompts instead of the full-screen dashboard.
-    #[arg(long)]
-    plain: bool,
-
-    #[command(flatten)]
-    relay: RelayArgs,
-
-    /// JSON-RPC endpoint override per chain, e.g. `1=https://eth.example`.
-    /// Chains without one use the WalletConnect blockchain API.
-    #[arg(long = "rpc", value_name = "CHAIN_ID=URL")]
-    rpc: Vec<String>,
-
-    /// Tenderly `ACCOUNT/PROJECT` (or its dashboard URL) that transaction
-    /// simulation links open in.
-    /// Without it they open in your default Tenderly project.
-    #[arg(long, env = "OPWALLET_TENDERLY_PROJECT", value_name = "ACCOUNT/PROJECT")]
-    tenderly_project: Option<String>,
-    /// WalletConnect Verify server used to confirm where proposals and
-    /// requests really come from.
-    #[arg(long, env = "OPWALLET_VERIFY_URL", default_value = walletconnect::VERIFY_SERVER)]
-    verify_url: String,
-
-    /// Skip WalletConnect Verify; prompts then show the dapp's claimed URL only.
-    #[arg(long, env = "OPWALLET_NO_VERIFY")]
-    no_verify: bool,
-}
-
-#[derive(Args)]
-struct WalletName {
-    /// Title of the 1Password item holding the wallet.
-    #[arg(long, short = 'n', env = "OPWALLET_NAME")]
-    name: String,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Check that the 1Password CLI is installed and signed in.
-    Doctor,
-
-    /// Generate a new seed phrase and store it in 1Password as a Crypto Wallet item.
-    Create {
-        #[command(flatten)]
-        wallet: WalletName,
-
-        /// Number of words in the seed phrase.
-        #[arg(long, short = 'w', default_value_t = 12, value_parser = clap::value_parser!(u8).range(12..=24))]
-        words: u8,
-
-        /// BIP-32 derivation path for the wallet address.
-        #[arg(long, default_value = DEFAULT_DERIVATION_PATH)]
-        path: String,
-
-        /// Print the seed phrase to the terminal after storing it (not recommended).
-        #[arg(long)]
-        reveal: bool,
-    },
-
-    /// List wallets stored in 1Password.
-    List,
-
-    /// Print a wallet's address after verifying it against the stored seed phrase.
-    Address {
-        #[command(flatten)]
-        wallet: WalletName,
-    },
-
-    /// Verify that the stored address matches the stored seed phrase.
-    Verify {
-        #[command(flatten)]
-        wallet: WalletName,
-    },
-
-    /// Sign a message with EIP-191 (`personal_sign`) semantics.
-    Sign {
-        #[command(flatten)]
-        wallet: WalletName,
-
-        /// Message to sign. Prefix with 0x to sign raw bytes instead of UTF-8 text.
-        #[arg(long, short = 'm')]
-        message: String,
-    },
-
-    /// Pair with a dapp over WalletConnect, then serve it and every saved session.
-    Connect {
-        /// Wallet(s) to connect; repeat for several. Prompts when omitted.
-        #[arg(long, short = 'n', env = "OPWALLET_NAME", value_delimiter = ',')]
-        name: Vec<String>,
-
-        /// WalletConnect pairing URI (wc:...), copied from the dapp. Prompts when omitted.
-        uri: Option<String>,
-
-        #[command(flatten)]
-        serve: ServeArgs,
-    },
-
-    /// List saved WalletConnect sessions.
-    Sessions,
-
-    /// End saved WalletConnect sessions and tell their dapps.
-    Disconnect {
-        /// Sessions to end: a number from `opwallet sessions`, part of the
-        /// dapp's name or URL, or a topic prefix.
-        session: Vec<String>,
-
-        /// End every saved session.
-        #[arg(long, conflicts_with = "session")]
-        all: bool,
-
-        #[command(flatten)]
-        relay: RelayArgs,
-    },
-}
+use serde_json::json;
 
 fn main() -> ExitCode {
     for warning in harden::harden_process() {
         eprintln!("warning: {warning}");
     }
-    let cli = Cli::parse();
+    let cli: Cli = cli::parse(ENV_PREFIX);
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -213,7 +53,7 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Create { wallet, words, path, reveal } => {
             create(&store, vault, &wallet.name, words as usize, &path, reveal)
         }
-        Commands::List => list(&store, vault),
+        Commands::List { output } => list(&store, vault, output),
         Commands::Address { wallet } => {
             let (stored, w) = load(&store, vault, &wallet.name)?;
             println!("{}", w.address());
@@ -237,34 +77,79 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Commands::Sign { wallet, message } => {
+            let bytes = message.bytes()?;
             let (_, w) = load(&store, vault, &wallet.name)?;
-            let bytes = if let Some(hex) = message.strip_prefix("0x") {
-                alloy_primitives::hex::decode(hex).context("message is not valid hex")?
-            } else {
-                message.into_bytes()
-            };
             println!("{}", w.sign_message(&bytes)?);
             Ok(())
+        }
+        Commands::SignTypedData { wallet, data } => {
+            let (_, _, hash) = eth::typed_data_digest(&data.json()?).map_err(rpc_error)?;
+            let (_, w) = load(&store, vault, &wallet.name)?;
+            println!("{}", eth::sign_typed_digest(&w, &hash)?);
+            Ok(())
+        }
+        Commands::SignTx { wallet, tx, chain } => {
+            transaction(&store, vault, &wallet.name, &tx, chain, false)
+        }
+        Commands::SendTx { wallet, tx, chain } => {
+            transaction(&store, vault, &wallet.name, &tx, chain, true)
         }
         Commands::Connect { name, uri, serve: args } => {
             serve(&store, vault, &state_dir, args, Some((uri, name)))
         }
-        Commands::Sessions => sessions(&state_dir),
-        Commands::Disconnect { session, all, relay } => disconnect(&state_dir, session, all, relay),
+        Commands::Sessions { output } => sessions(&state_dir, output),
+        Commands::Disconnect { disconnect: d, relay } => disconnect(&state_dir, d, relay),
     }
 }
 
+/// Older name of the project ID variable, still honoured.
+const LEGACY_PROJECT_ID_VAR: &str = "OPWALLET_WC_PROJECT_ID";
+
 fn project_id(given: Option<String>) -> Result<String> {
-    given
-        .or_else(|| std::env::var("OPWALLET_WC_PROJECT_ID").ok())
-        .map(|p| p.trim().to_string())
-        .filter(|p| !p.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no WalletConnect project ID: pass --project-id or set OPWALLET_PROJECT_ID \
-                 (free at https://dashboard.walletconnect.com)"
-            )
-        })
+    cli::require_project_id(given, &[LEGACY_PROJECT_ID_VAR], "OPWALLET_PROJECT_ID")
+}
+
+fn rpc_error(e: RpcError) -> anyhow::Error {
+    anyhow!("{}", e.message)
+}
+
+/// `sign-tx` / `send-tx`: build the transaction from public data (address
+/// field, chain), show it, then read the seed once to sign it.
+fn transaction(
+    store: &OpCli,
+    vault: Option<&str>,
+    name: &str,
+    tx: &TxArgs,
+    chain: ChainArgs,
+    broadcast: bool,
+) -> Result<()> {
+    let address: Address = store
+        .get_address(name, vault)?
+        .ok_or_else(|| anyhow!("wallet {name:?} has no wallet address field"))?
+        .trim()
+        .parse()
+        .with_context(|| format!("wallet {name:?} has an invalid address"))?;
+    let overrides = walletconnect::parse_rpc_overrides(&chain.rpc.rpc)?;
+    let project = cli::project_id(chain.project_id, &[LEGACY_PROJECT_ID_VAR]).unwrap_or_default();
+    let rpc = RpcClient::new(&project, overrides);
+    let prepared = eth::prepare_transaction(&tx.to_json(address), &rpc, tx.chain, address)
+        .map_err(rpc_error)?;
+    let account = Account { name: name.to_string(), address };
+    eprintln!("{}", eth::describe(&prepared, tx.chain, &account));
+
+    let (_, w) = load(store, vault, name)?;
+    if w.address() != address {
+        bail!("1Password item {name:?} no longer derives {address}");
+    }
+    let raw = hex::encode_prefixed(eth::sign_transaction(prepared, &w)?);
+    drop(w);
+    if !broadcast {
+        println!("{raw}");
+        return Ok(());
+    }
+    let hash = rpc.call(tx.chain, "eth_sendRawTransaction", json!([raw]))?;
+    println!("{}", hash.as_str().map(str::to_string).unwrap_or_else(|| hash.to_string()));
+    Ok(())
 }
 
 fn doctor(store: &dyn SecretStore, vault: Option<&str>) -> Result<()> {
@@ -342,9 +227,17 @@ fn create_verified(
     Ok((created, address, stored))
 }
 
-fn list(store: &dyn SecretStore, vault: Option<&str>) -> Result<()> {
+fn list(store: &dyn SecretStore, vault: Option<&str>, output: OutputArgs) -> Result<()> {
     let mut wallets = store.list_wallets(vault)?;
     onepassword::sort_wallets(&mut wallets);
+    if output.json {
+        let rows: Vec<_> = wallets
+            .iter()
+            .map(|w| json!({ "name": w.title, "address": w.address, "id": w.id, "vault": w.vault }))
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
     if wallets.is_empty() {
         println!("No Crypto Wallet items found. Create one with `opwallet create --name <name>`.");
         return Ok(());
@@ -410,7 +303,7 @@ fn serve(
     args: ServeArgs,
     pair: Option<(Option<String>, Vec<String>)>,
 ) -> Result<()> {
-    let rpc_overrides = walletconnect::parse_rpc_overrides(&args.rpc)?;
+    let rpc_overrides = walletconnect::parse_rpc_overrides(&args.rpc.rpc)?;
     let tenderly = args
         .tenderly_project
         .as_deref()
@@ -455,8 +348,29 @@ fn serve(
     walletconnect::run(opts, sessions, initial, &wallets, ui.as_mut())
 }
 
-fn sessions(state_dir: &std::path::Path) -> Result<()> {
+fn sessions(state_dir: &std::path::Path, output: OutputArgs) -> Result<()> {
     let state = store::read(state_dir)?;
+    if output.json {
+        let rows: Vec<_> = state
+            .sessions
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                json!({
+                    "number": i + 1,
+                    "topic": s.topic,
+                    "dapp": s.peer.name,
+                    "url": s.peer.url,
+                    "expiry": s.expiry,
+                    "chains": s.chains,
+                    "wallets": s.accounts,
+                    "active": s.accounts.get(s.active).map(|a| &a.address),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
     if state.sessions.is_empty() {
         println!("No saved sessions.");
         return Ok(());
@@ -494,12 +408,8 @@ fn sessions(state_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn disconnect(
-    state_dir: &std::path::Path,
-    selectors: Vec<String>,
-    all: bool,
-    relay: RelayArgs,
-) -> Result<()> {
+fn disconnect(state_dir: &std::path::Path, args: DisconnectArgs, relay: RelayArgs) -> Result<()> {
+    let DisconnectArgs { session: selectors, all } = args;
     let store = SessionStore::open(state_dir)?;
     let state = store.load()?;
     let mut indices: Vec<usize> = if all {

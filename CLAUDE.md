@@ -45,6 +45,15 @@
   spec is outdated; the JS `sign-client` engine and the reference
   `react-wallet-v2` are the source of truth. `wc_sessionAuthenticate` is
   legacy and intentionally unsupported.
+- `src/cli/`: both programs' command lines. Shared arguments are defined
+  once in `mod.rs`; `opwallet.rs` and `wcapp.rs` hold each `Cli`. Env vars
+  are applied at parse time from a prefix (`OPWALLET_`/`WCAPP_` + arg id).
+- `src/bin/wcapp.rs` + `src/walletconnect/dapp.rs`: `wcapp`, the dapp side
+  of WalletConnect, taking opwallet's commands and flags and sending them
+  to a wallet. Keep the two programs in sync: a new command or flag goes
+  into both, or into `tests/parity.rs`'s list of deliberate differences.
+  `tests/wcapp.rs` runs wcapp against opwallet through an in-process relay
+  and requires byte-identical results from both.
 - `tests/fake-op/op`: Python stand-in for the 1Password CLI used by the
   end-to-end tests in `tests/cli.rs`.
 

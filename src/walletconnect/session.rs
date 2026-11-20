@@ -9,17 +9,21 @@ use serde_json::{Value, json};
 use super::auth::AuthPayload;
 
 // Message tags (used by the relay for push routing) and TTLs, per the spec.
+pub const TAG_SESSION_PROPOSE_REQ: u64 = 1100;
 pub const TAG_SESSION_PROPOSE_RES: u64 = 1101;
 pub const TAG_SESSION_SETTLE_REQ: u64 = 1102;
+pub const TAG_SESSION_SETTLE_RES: u64 = 1103;
 pub const TAG_SESSION_UPDATE_REQ: u64 = 1104;
 pub const TAG_SESSION_UPDATE_RES: u64 = 1105;
 pub const TAG_SESSION_EXTEND_REQ: u64 = 1106;
 pub const TAG_SESSION_EXTEND_RES: u64 = 1107;
+pub const TAG_SESSION_REQUEST_REQ: u64 = 1108;
 pub const TAG_SESSION_REQUEST_RES: u64 = 1109;
 pub const TAG_SESSION_EVENT_REQ: u64 = 1110;
 pub const TAG_SESSION_EVENT_RES: u64 = 1111;
 pub const TAG_SESSION_DELETE_REQ: u64 = 1112;
 pub const TAG_SESSION_DELETE_RES: u64 = 1113;
+pub const TAG_SESSION_PING_REQ: u64 = 1114;
 pub const TAG_SESSION_PING_RES: u64 = 1115;
 pub const TAG_PAIRING_DELETE_RES: u64 = 1001;
 pub const TAG_PAIRING_PING_RES: u64 = 1003;
